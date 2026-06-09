@@ -35,7 +35,7 @@ def obtener_opciones(nombre_archivo, url):
             "cookiefile": "cookies.txt",
         }
 
-    # Instagram = estable (sin ffmpeg)
+    # Instagram = estable
     return {
         "format": "best",
         "outtmpl": nombre_archivo,
@@ -61,8 +61,17 @@ def download_video():
     opciones = obtener_opciones(nombre_archivo, url)
 
     try:
-        with yt_dlp.YoutubeDL(opciones) as ydl:
-            ydl.download([url])
+        try:
+            with yt_dlp.YoutubeDL(opciones) as ydl:
+                ydl.download([url])
+
+        except Exception:
+            print("Primer intento falló, reintentando...")
+            import time
+            time.sleep(2)
+
+            with yt_dlp.YoutubeDL(opciones) as ydl:
+                ydl.download([url])
 
         if not os.path.exists(nombre_archivo):
             return {"error": "No se descargó el archivo"}, 500
@@ -102,8 +111,16 @@ async def descargar_video(update: Update, context: ContextTypes.DEFAULT_TYPE):
         opciones = obtener_opciones(nombre_archivo, mensaje)
 
         try:
-            with yt_dlp.YoutubeDL(opciones) as ydl:
-                ydl.download([mensaje])
+            try:
+                with yt_dlp.YoutubeDL(opciones) as ydl:
+                    ydl.download([mensaje])
+
+            except Exception:
+                print("Primer intento falló, reintentando...")
+                await asyncio.sleep(2)
+
+                with yt_dlp.YoutubeDL(opciones) as ydl:
+                    ydl.download([mensaje])
 
             if not os.path.exists(nombre_archivo):
                 raise Exception("No se descargó el archivo")
