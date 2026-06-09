@@ -64,19 +64,29 @@ async def descargar_video(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     nombre_archivo = f"{uuid.uuid4()}.mp4"
 
-    opciones = {
-        "format": "bestvideo+bestaudio/best",
-        "outtmpl": nombre_archivo,
-        "merge_output_format": "mp4",
-        "quiet": False,
-        "noplaylist": True,
-        "cookiefile": "cookies.txt",
-        "extractor_args": {
-            "tiktok": {
-                "api_hostname": "api16-normal-c-useast1a.tiktokv.com"
-            }
+   opciones = {
+    "format": "bestvideo+bestaudio/best",
+    "outtmpl": nombre_archivo,
+    "merge_output_format": "mp4",
+    "quiet": True,
+    "noplaylist": True,
+    "cookiefile": "cookies.txt",
+    "retries": 10,
+    "fragment_retries": 10,
+    "extractor_retries": 10,
+    "http_headers": {
+        "User-Agent": (
+            "Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X) "
+            "AppleWebKit/605.1.15 (KHTML, like Gecko) "
+            "Version/17.0 Mobile/15E148 Safari/604.1"
+        )
+    },
+    "extractor_args": {
+        "tiktok": {
+            "api_hostname": "api16-normal-c-useast1a.tiktokv.com"
         }
     }
+}
     
     try:
         with yt_dlp.YoutubeDL(opciones) as ydl:
