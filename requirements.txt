@@ -5,3 +5,4 @@ requests
 curl-cffi
 brotli
 certifi
+browser-cookie3
