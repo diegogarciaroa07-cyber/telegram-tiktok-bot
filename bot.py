@@ -18,16 +18,19 @@ def obtener_opciones(nombre_archivo):
         "quiet": False,
         "noplaylist": True,
 
-        # Reintentos
+        # cookies TikTok
+        "cookiefile": "cookies.txt",
+
+        # reintentos
         "retries": 20,
         "fragment_retries": 20,
         "extractor_retries": 20,
         "socket_timeout": 60,
 
-        # Configuración TikTok
+        # mejor compatibilidad TikTok
         "extractor_args": {
             "tiktok": {
-                "app_info": ["ios"]
+                "api_hostname": "api16-normal-c-useast1a.tiktokv.com"
             }
         },
 
@@ -63,6 +66,8 @@ def download_video():
             print("Primer método falló, intentando alternativo...")
 
             opciones2 = opciones.copy()
+
+            # fallback
             opciones2.pop("extractor_args", None)
 
             with yt_dlp.YoutubeDL(opciones2) as ydl:
@@ -116,6 +121,8 @@ async def descargar_video(update: Update, context: ContextTypes.DEFAULT_TYPE):
             print("Primer método falló, intentando alternativo...")
 
             opciones2 = opciones.copy()
+
+            # fallback si TikTok bloquea
             opciones2.pop("extractor_args", None)
 
             with yt_dlp.YoutubeDL(opciones2) as ydl:
