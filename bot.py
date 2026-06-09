@@ -23,6 +23,9 @@ def obtener_opciones(nombre_archivo):
         "extractor_retries": 15,
         "socket_timeout": 30,
 
+        # IMPORTANTE para TikTok
+        "impersonate": "safari_ios",
+
         "http_headers": {
             "User-Agent": (
                 "Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X) "
@@ -60,7 +63,10 @@ def download_video():
             print("Primer método falló, intentando alternativo...")
 
             opciones2 = opciones.copy()
+
+            # quitar opciones problemáticas
             opciones2.pop("extractor_args", None)
+            opciones2.pop("impersonate", None)
 
             with yt_dlp.YoutubeDL(opciones2) as ydl:
                 ydl.download([url])
@@ -110,7 +116,10 @@ async def descargar_video(update: Update, context: ContextTypes.DEFAULT_TYPE):
             print("Primer método falló, intentando alternativo...")
 
             opciones2 = opciones.copy()
+
+            # quitar opciones problemáticas
             opciones2.pop("extractor_args", None)
+            opciones2.pop("impersonate", None)
 
             with yt_dlp.YoutubeDL(opciones2) as ydl:
                 ydl.download([mensaje])
