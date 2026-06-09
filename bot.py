@@ -10,6 +10,36 @@ TOKEN = os.getenv("BOT_TOKEN")
 app_web = Flask(__name__)
 
 
+def obtener_opciones(nombre_archivo):
+    return {
+        "format": "best",
+        "outtmpl": nombre_archivo,
+        "merge_output_format": "mp4",
+        "quiet": False,
+        "noplaylist": True,
+        "cookiefile": "cookies.txt",
+        "retries": 15,
+        "fragment_retries": 15,
+        "extractor_retries": 15,
+        "socket_timeout": 30,
+
+        "http_headers": {
+            "User-Agent": (
+                "Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X) "
+                "AppleWebKit/605.1.15 (KHTML, like Gecko) "
+                "Version/17.0 Mobile/15E148 Safari/604.1"
+            ),
+            "Referer": "https://www.tiktok.com/",
+        },
+
+        "extractor_args": {
+            "tiktok": {
+                "api_hostname": "api16-normal-c-useast1a.tiktokv.com"
+            }
+        }
+    }
+
+
 @app_web.route("/download", methods=["POST"])
 def download_video():
     data = request.get_json()
@@ -19,30 +49,7 @@ def download_video():
         return {"error": "No URL"}, 400
 
     nombre_archivo = f"{uuid.uuid4()}.mp4"
-
-    opciones = {
-        "format": "bestvideo+bestaudio/best",
-        "outtmpl": nombre_archivo,
-        "merge_output_format": "mp4",
-        "quiet": True,
-        "noplaylist": True,
-        "cookiefile": "cookies.txt",
-        "retries": 10,
-        "fragment_retries": 10,
-        "extractor_retries": 10,
-        "http_headers": {
-            "User-Agent": (
-                "Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X) "
-                "AppleWebKit/605.1.15 (KHTML, like Gecko) "
-                "Version/17.0 Mobile/15E148 Safari/604.1"
-            )
-        },
-        "extractor_args": {
-            "tiktok": {
-                "api_hostname": "api16-normal-c-useast1a.tiktokv.com"
-            }
-        }
-    }
+    opciones = obtener_opciones(nombre_archivo)
 
     try:
         try:
@@ -92,30 +99,7 @@ async def descargar_video(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
 
     nombre_archivo = f"{uuid.uuid4()}.mp4"
-
-    opciones = {
-        "format": "bestvideo+bestaudio/best",
-        "outtmpl": nombre_archivo,
-        "merge_output_format": "mp4",
-        "quiet": True,
-        "noplaylist": True,
-        "cookiefile": "cookies.txt",
-        "retries": 10,
-        "fragment_retries": 10,
-        "extractor_retries": 10,
-        "http_headers": {
-            "User-Agent": (
-                "Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X) "
-                "AppleWebKit/605.1.15 (KHTML, like Gecko) "
-                "Version/17.0 Mobile/15E148 Safari/604.1"
-            )
-        },
-        "extractor_args": {
-            "tiktok": {
-                "api_hostname": "api16-normal-c-useast1a.tiktokv.com"
-            }
-        }
-    }
+    opciones = obtener_opciones(nombre_archivo)
 
     try:
         try:
@@ -141,7 +125,7 @@ async def descargar_video(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     except Exception as e:
         await esperando.edit_text(
-            f"❌ Error al descargar:\n{str(e)[:150]}"
+            f"❌ No pude descargar ese TikTok.\n\n{str(e)[:120]}"
         )
 
     finally:
