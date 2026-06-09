@@ -88,9 +88,24 @@ async def descargar_video(update: Update, context: ContextTypes.DEFAULT_TYPE):
         }
     }
     
+try:
     try:
         with yt_dlp.YoutubeDL(opciones) as ydl:
             ydl.download([mensaje])
+
+    except Exception:
+        print("Primer método falló, intentando alternativo...")
+
+        opciones2 = opciones.copy()
+        opciones2.pop("extractor_args", None)
+
+        with yt_dlp.YoutubeDL(opciones2) as ydl:
+            ydl.download([mensaje])
+
+except Exception as e:
+    await esperando.edit_text(f"❌ Error al descargar:\n{str(e)[:150]}")
+    return
+
 
         with open(nombre_archivo, "rb") as video:
             await update.message.reply_video(
@@ -100,7 +115,7 @@ async def descargar_video(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         await esperando.delete()
 
-    except Exception:
+ except Exception:
         await esperando.edit_text(
             "❌ No pude descargar ese TikTok."
         )
