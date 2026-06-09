@@ -4,7 +4,9 @@ import yt_dlp
 import os
 import uuid
 
-TOKEN = "TU_TOKEN_AQUI"
+import os
+
+TOKEN = os.getenv("BOT_TOKEN")
 
 
 async def descargar_video(update: Update, context: ContextTypes.DEFAULT_TYPE):
