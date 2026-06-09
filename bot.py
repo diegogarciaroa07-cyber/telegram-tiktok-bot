@@ -23,11 +23,22 @@ def es_link_valido(link):
     )
 
 
-def obtener_opciones(nombre_archivo):
+def obtener_opciones(nombre_archivo, url):
+    # TikTok = máxima calidad
+    if "tiktok.com" in url or "vt.tiktok.com" in url:
+        return {
+            "format": "bestvideo+bestaudio/best",
+            "outtmpl": nombre_archivo,
+            "merge_output_format": "mp4",
+            "quiet": True,
+            "noplaylist": True,
+            "cookiefile": "cookies.txt",
+        }
+
+    # Instagram = estable (sin ffmpeg)
     return {
-        "format": "bestvideo+bestaudio/best",
+        "format": "best",
         "outtmpl": nombre_archivo,
-        "merge_output_format": "mp4",
         "quiet": True,
         "noplaylist": True,
         "cookiefile": "cookies.txt",
@@ -47,7 +58,7 @@ def download_video():
         return {"error": "Link no válido"}, 400
 
     nombre_archivo = f"{uuid.uuid4()}.mp4"
-    opciones = obtener_opciones(nombre_archivo)
+    opciones = obtener_opciones(nombre_archivo, url)
 
     try:
         with yt_dlp.YoutubeDL(opciones) as ydl:
@@ -88,7 +99,7 @@ async def descargar_video(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
 
         nombre_archivo = f"{uuid.uuid4()}.mp4"
-        opciones = obtener_opciones(nombre_archivo)
+        opciones = obtener_opciones(nombre_archivo, mensaje)
 
         try:
             with yt_dlp.YoutubeDL(opciones) as ydl:
