@@ -1,9 +1,9 @@
 python-telegram-bot
 yt-dlp[default]
+flask
+requests
 curl-cffi
 brotli
 certifi
-flask
-requests
 pycryptodomex
 websockets
