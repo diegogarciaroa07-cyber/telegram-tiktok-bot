@@ -3,11 +3,51 @@ from telegram.ext import Application, MessageHandler, ContextTypes, filters
 import yt_dlp
 import os
 import uuid
-from flask import Flask
+from flask import Flask, request, send_file
 import threading
 
 TOKEN = os.getenv("BOT_TOKEN")
 app_web = Flask(__name__)
+
+
+@app_web.route("/download", methods=["POST"])
+def download_video():
+    data = request.get_json()
+
+    if not data or "url" not in data:
+        return {"error": "No URL"}, 400
+
+    url = data["url"]
+    nombre_archivo = f"{uuid.uuid4()}.mp4"
+
+    opciones = {
+        "format": "bestvideo+bestaudio/best",
+        "outtmpl": nombre_archivo,
+        "merge_output_format": "mp4",
+        "quiet": True,
+        "noplaylist": True,
+        "cookiefile": "cookies.txt",
+    }
+
+    try:
+        with yt_dlp.YoutubeDL(opciones) as ydl:
+            ydl.download([url])
+
+        if not os.path.exists(nombre_archivo):
+            return {"error": "No se descargó el archivo"}, 500
+
+        return send_file(
+            nombre_archivo,
+            as_attachment=True,
+            download_name="video.mp4",
+            mimetype="video/mp4"
+        )
+
+    except Exception as e:
+        return {"error": str(e)}, 500
+
+    finally:
+        pass
 
 
 def iniciar_web():
