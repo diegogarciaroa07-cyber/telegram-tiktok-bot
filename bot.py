@@ -37,9 +37,6 @@ async def descargar_video(update: Update, context: ContextTypes.DEFAULT_TYPE):
             }
         }
     }
-
-    try:
-
     
     try:
         with yt_dlp.YoutubeDL(opciones) as ydl:
