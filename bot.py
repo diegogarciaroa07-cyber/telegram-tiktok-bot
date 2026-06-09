@@ -17,11 +17,12 @@ def obtener_opciones(nombre_archivo):
         "merge_output_format": "mp4",
         "quiet": False,
         "noplaylist": True,
-        "cookiefile": "cookies.txt",
-        "retries": 15,
-        "fragment_retries": 15,
-        "extractor_retries": 15,
-        "socket_timeout": 30,
+
+        # Reintentos
+        "retries": 20,
+        "fragment_retries": 20,
+        "extractor_retries": 20,
+        "socket_timeout": 60,
 
         # IMPORTANTE para TikTok
         "impersonate": "safari_ios",
@@ -33,12 +34,6 @@ def obtener_opciones(nombre_archivo):
                 "Version/17.0 Mobile/15E148 Safari/604.1"
             ),
             "Referer": "https://www.tiktok.com/",
-        },
-
-        "extractor_args": {
-            "tiktok": {
-                "api_hostname": "api16-normal-c-useast1a.tiktokv.com"
-            }
         }
     }
 
@@ -46,12 +41,13 @@ def obtener_opciones(nombre_archivo):
 @app_web.route("/download", methods=["POST"])
 def download_video():
     data = request.get_json()
-    url = data.get("url")
 
-    if not url:
+    if not data or "url" not in data:
         return {"error": "No URL"}, 400
 
+    url = data["url"]
     nombre_archivo = f"{uuid.uuid4()}.mp4"
+
     opciones = obtener_opciones(nombre_archivo)
 
     try:
@@ -64,8 +60,7 @@ def download_video():
 
             opciones2 = opciones.copy()
 
-            # quitar opciones problemáticas
-            opciones2.pop("extractor_args", None)
+            # fallback si impersonate falla
             opciones2.pop("impersonate", None)
 
             with yt_dlp.YoutubeDL(opciones2) as ydl:
@@ -94,7 +89,7 @@ def iniciar_web():
 async def descargar_video(update: Update, context: ContextTypes.DEFAULT_TYPE):
     mensaje = update.message.text.strip()
 
-    if "tiktok.com" not in mensaje:
+    if "tiktok.com" not in mensaje and "vt.tiktok.com" not in mensaje:
         await update.message.reply_text(
             "📎 Mándame un link válido de TikTok."
         )
@@ -117,12 +112,14 @@ async def descargar_video(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
             opciones2 = opciones.copy()
 
-            # quitar opciones problemáticas
-            opciones2.pop("extractor_args", None)
+            # fallback sin impersonate
             opciones2.pop("impersonate", None)
 
             with yt_dlp.YoutubeDL(opciones2) as ydl:
                 ydl.download([mensaje])
+
+        if not os.path.exists(nombre_archivo):
+            raise Exception("El archivo no se descargó.")
 
         with open(nombre_archivo, "rb") as video:
             await update.message.reply_video(
@@ -134,7 +131,7 @@ async def descargar_video(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     except Exception as e:
         await esperando.edit_text(
-            f"❌ No pude descargar ese TikTok.\n\n{str(e)[:120]}"
+            f"❌ No pude descargar ese TikTok.\n\n{str(e)[:150]}"
         )
 
     finally:
