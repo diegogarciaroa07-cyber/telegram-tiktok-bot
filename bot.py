@@ -3,12 +3,12 @@ from telegram.ext import Application, MessageHandler, ContextTypes, filters
 import yt_dlp
 import os
 import uuid
-
 from flask import Flask, request, send_file
 import threading
 
 TOKEN = os.getenv("BOT_TOKEN")
 app_web = Flask(__name__)
+
 
 @app_web.route("/download", methods=["POST"])
 def download_video():
@@ -27,11 +27,36 @@ def download_video():
         "quiet": True,
         "noplaylist": True,
         "cookiefile": "cookies.txt",
+        "retries": 10,
+        "fragment_retries": 10,
+        "extractor_retries": 10,
+        "http_headers": {
+            "User-Agent": (
+                "Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X) "
+                "AppleWebKit/605.1.15 (KHTML, like Gecko) "
+                "Version/17.0 Mobile/15E148 Safari/604.1"
+            )
+        },
+        "extractor_args": {
+            "tiktok": {
+                "api_hostname": "api16-normal-c-useast1a.tiktokv.com"
+            }
+        }
     }
 
     try:
-        with yt_dlp.YoutubeDL(opciones) as ydl:
-            ydl.download([url])
+        try:
+            with yt_dlp.YoutubeDL(opciones) as ydl:
+                ydl.download([url])
+
+        except Exception:
+            print("Primer método falló, intentando alternativo...")
+
+            opciones2 = opciones.copy()
+            opciones2.pop("extractor_args", None)
+
+            with yt_dlp.YoutubeDL(opciones2) as ydl:
+                ydl.download([url])
 
         return send_file(
             nombre_archivo,
@@ -42,6 +67,10 @@ def download_video():
 
     except Exception as e:
         return {"error": str(e)}, 500
+
+    finally:
+        if os.path.exists(nombre_archivo):
+            os.remove(nombre_archivo)
 
 
 def iniciar_web():
@@ -87,37 +116,32 @@ async def descargar_video(update: Update, context: ContextTypes.DEFAULT_TYPE):
             }
         }
     }
-    
-try:
+
     try:
-        with yt_dlp.YoutubeDL(opciones) as ydl:
-            ydl.download([mensaje])
+        try:
+            with yt_dlp.YoutubeDL(opciones) as ydl:
+                ydl.download([mensaje])
 
-    except Exception:
-        print("Primer método falló, intentando alternativo...")
+        except Exception:
+            print("Primer método falló, intentando alternativo...")
 
-        opciones2 = opciones.copy()
-        opciones2.pop("extractor_args", None)
+            opciones2 = opciones.copy()
+            opciones2.pop("extractor_args", None)
 
-        with yt_dlp.YoutubeDL(opciones2) as ydl:
-            ydl.download([mensaje])
+            with yt_dlp.YoutubeDL(opciones2) as ydl:
+                ydl.download([mensaje])
 
-except Exception as e:
-    await esperando.edit_text(f"❌ Error al descargar:\n{str(e)[:150]}")
-    return
+        with open(nombre_archivo, "rb") as video:
+            await update.message.reply_video(
+                video=video,
+                caption="✅ Aquí está tu video sin marca de agua"
+            )
 
+        await esperando.delete()
 
-    with open(nombre_archivo, "rb") as video:
-        await update.message.reply_video(
-            video=video,
-            caption="✅ Aquí está tu video sin marca de agua"
-         )
-
-    await esperando.delete()
-
- except Exception:
+    except Exception as e:
         await esperando.edit_text(
-            "❌ No pude descargar ese TikTok."
+            f"❌ Error al descargar:\n{str(e)[:150]}"
         )
 
     finally:
