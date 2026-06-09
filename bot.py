@@ -30,6 +30,7 @@ async def descargar_video(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "merge_output_format": "mp4",
         "quiet": True,
         "noplaylist": True,
+        "cookiefile": "cookies.json",
     }
 
     try:
