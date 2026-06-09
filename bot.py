@@ -19,6 +19,7 @@ def es_link_valido(link):
         "tiktok.com" in link
         or "vt.tiktok.com" in link
         or "instagram.com/reel/" in link
+        or "instagram.com/p/" in link
     )
 
 
@@ -76,7 +77,7 @@ async def descargar_video(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     if not es_link_valido(mensaje):
         await update.message.reply_text(
-            "📎 Mándame un link válido de TikTok o Reel de Instagram."
+            "📎 Mándame un link válido de TikTok o Instagram."
         )
         return
 
