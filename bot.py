@@ -107,13 +107,13 @@ except Exception as e:
     return
 
 
-        with open(nombre_archivo, "rb") as video:
-            await update.message.reply_video(
-                video=video,
-                caption="✅ Aquí está tu video sin marca de agua"
-            )
+    with open(nombre_archivo, "rb") as video:
+        await update.message.reply_video(
+            video=video,
+            caption="✅ Aquí está tu video sin marca de agua"
+         )
 
-        await esperando.delete()
+    await esperando.delete()
 
  except Exception:
         await esperando.edit_text(
