@@ -64,7 +64,7 @@ async def descargar_video(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     nombre_archivo = f"{uuid.uuid4()}.mp4"
 
-        opciones = {
+    opciones = {
         "format": "bestvideo+bestaudio/best",
         "outtmpl": nombre_archivo,
         "merge_output_format": "mp4",
