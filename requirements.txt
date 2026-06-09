@@ -1,9 +1,4 @@
 python-telegram-bot
-yt-dlp[default]
+yt-dlp
 flask
 requests
-curl-cffi
-brotli
-certifi
-pycryptodomex
-websockets
