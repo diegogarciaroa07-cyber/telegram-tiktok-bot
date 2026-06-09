@@ -1,5 +1,7 @@
-python-telegram-bot
+python-telegram-bot==22.1
 yt-dlp[default]
 flask
 requests
 curl-cffi
+brotli
+certifi
