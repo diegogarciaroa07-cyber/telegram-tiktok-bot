@@ -1,8 +1,9 @@
-python-telegram-bot==22.1
+python-telegram-bot
 yt-dlp[default]
-flask
-requests
 curl-cffi
 brotli
 certifi
-browser-cookie3
+flask
+requests
+pycryptodomex
+websockets
