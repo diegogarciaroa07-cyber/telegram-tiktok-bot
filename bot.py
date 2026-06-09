@@ -5,9 +5,13 @@ import os
 import uuid
 from flask import Flask, request, send_file
 import threading
+import asyncio
 
 TOKEN = os.getenv("BOT_TOKEN")
 app_web = Flask(__name__)
+
+# Cola de descargas
+cola_descargas = asyncio.Lock()
 
 
 @app_web.route("/download", methods=["POST"])
@@ -46,9 +50,6 @@ def download_video():
     except Exception as e:
         return {"error": str(e)}, 500
 
-    finally:
-        pass
-
 
 def iniciar_web():
     puerto = int(os.environ.get("PORT", 8080))
@@ -58,47 +59,52 @@ def iniciar_web():
 async def descargar_video(update: Update, context: ContextTypes.DEFAULT_TYPE):
     mensaje = update.message.text.strip()
 
-    if "tiktok.com" not in mensaje:
+    if (
+        "tiktok.com" not in mensaje
+        and "vt.tiktok.com" not in mensaje
+    ):
         await update.message.reply_text(
             "📎 Mándame un link válido de TikTok."
         )
         return
 
-    esperando = await update.message.reply_text(
-        "⏳ Descargando video..."
-    )
+    async with cola_descargas:
 
-    nombre_archivo = f"{uuid.uuid4()}.mp4"
-
-    opciones = {
-        "format": "bestvideo+bestaudio/best",
-        "outtmpl": nombre_archivo,
-        "merge_output_format": "mp4",
-        "quiet": True,
-        "noplaylist": True,
-        "cookiefile": "cookies.txt",
-    }
-
-    try:
-        with yt_dlp.YoutubeDL(opciones) as ydl:
-            ydl.download([mensaje])
-
-        with open(nombre_archivo, "rb") as video:
-            await update.message.reply_video(
-                video=video,
-                caption="✅ Aquí está tu video sin marca de agua"
-            )
-
-        await esperando.delete()
-
-    except Exception:
-        await esperando.edit_text(
-            "❌ No pude descargar ese TikTok."
+        esperando = await update.message.reply_text(
+            "⏳ Descargando video..."
         )
 
-    finally:
-        if os.path.exists(nombre_archivo):
-            os.remove(nombre_archivo)
+        nombre_archivo = f"{uuid.uuid4()}.mp4"
+
+        opciones = {
+            "format": "bestvideo+bestaudio/best",
+            "outtmpl": nombre_archivo,
+            "merge_output_format": "mp4",
+            "quiet": True,
+            "noplaylist": True,
+            "cookiefile": "cookies.txt",
+        }
+
+        try:
+            with yt_dlp.YoutubeDL(opciones) as ydl:
+                ydl.download([mensaje])
+
+            with open(nombre_archivo, "rb") as video:
+                await update.message.reply_video(
+                    video=video,
+                    caption="✅ Aquí está tu video sin marca de agua"
+                )
+
+            await esperando.delete()
+
+        except Exception:
+            await esperando.edit_text(
+                "❌ No pude descargar ese TikTok."
+            )
+
+        finally:
+            if os.path.exists(nombre_archivo):
+                os.remove(nombre_archivo)
 
 
 def main():
