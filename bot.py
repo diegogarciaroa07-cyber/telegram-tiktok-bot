@@ -1,25 +1,37 @@
 from telegram import Update
 from telegram.ext import Application, MessageHandler, ContextTypes, filters
+
 import yt_dlp
 import os
 import uuid
 import time
+import glob
 import threading
 import asyncio
 
 from flask import Flask, request, send_file, after_this_request
 
 
+# =========================================================
+# CONFIGURACIÓN
+# =========================================================
+
 TOKEN = os.getenv("BOT_TOKEN")
+
+# Opcional.
+# NO inventes este valor.
+# Solo se usa si algún día tienes un IID real de TikTok.
+TIKTOK_IID = os.getenv("TIKTOK_IID")
 
 app_web = Flask(__name__)
 
-# Cola de descargas de Telegram
+# Cola para evitar que varias descargas de Telegram
+# se pisen al mismo tiempo.
 cola_descargas = asyncio.Lock()
 
 
 # =========================================================
-# RUTA PRINCIPAL PARA RENDER
+# RUTAS DE ESTADO PARA RENDER
 # =========================================================
 
 @app_web.route("/")
@@ -30,19 +42,31 @@ def home():
     }, 200
 
 
+@app_web.route("/healthz")
+def healthz():
+    return {
+        "status": "ok"
+    }, 200
+
+
 # =========================================================
 # DETECCIÓN DE LINKS
 # =========================================================
 
 def es_tiktok(url):
+    url = url.lower()
+
     return (
         "tiktok.com" in url
         or "vt.tiktok.com" in url
         or "vm.tiktok.com" in url
+        or "tiktokv.com" in url
     )
 
 
 def es_instagram(url):
+    url = url.lower()
+
     return (
         "instagram.com/reel/" in url
         or "instagram.com/reels/" in url
@@ -55,13 +79,35 @@ def es_link_valido(url):
 
 
 # =========================================================
-# OPCIONES GENERALES
+# LIMPIEZA DE ARCHIVOS TEMPORALES
+# =========================================================
+
+def limpiar_temporales(nombre_archivo):
+    """
+    Borra restos .part, formatos separados y archivos
+    temporales que yt-dlp puede dejar después de un fallo.
+    """
+
+    base = os.path.splitext(nombre_archivo)[0]
+
+    for archivo in glob.glob(f"{base}*"):
+
+        try:
+            if os.path.isfile(archivo):
+                os.remove(archivo)
+
+        except Exception as e:
+            print(f"No se pudo borrar temporal {archivo}: {e}")
+
+
+# =========================================================
+# OPCIONES PARA TIKTOK
 # =========================================================
 
 def opciones_tiktok(nombre_archivo, metodo=1):
 
     opciones = {
-        # Máxima calidad posible
+        # Mantiene la máxima calidad disponible.
         "format": "bestvideo+bestaudio/best",
 
         "outtmpl": nombre_archivo,
@@ -75,43 +121,101 @@ def opciones_tiktok(nombre_archivo, metodo=1):
         "extractor_retries": 3,
 
         "socket_timeout": 30,
+
+        # No forzamos impersonate.
+        # Render ya confirmó que chrome no está disponible.
     }
 
-    # -----------------------------------------------------
+
+    # =====================================================
     # MÉTODO 1
-    # Cookies + navegador Chrome
-    # -----------------------------------------------------
+    # Cookies actuales
+    # =====================================================
 
     if metodo == 1:
-        opciones["cookiefile"] = "cookies.txt"
-        opciones["impersonate"] = "chrome"
 
-    # -----------------------------------------------------
+        opciones["cookiefile"] = "cookies.txt"
+
+
+    # =====================================================
     # MÉTODO 2
-    # Chrome sin cookies
-    # Algunas veces TikTok rechaza cookies viejas
-    # -----------------------------------------------------
+    # Sin cookies
+    #
+    # A veces una sesión/cookie puede provocar que TikTok
+    # responda diferente.
+    # =====================================================
 
     elif metodo == 2:
-        opciones["impersonate"] = "chrome"
 
-    # -----------------------------------------------------
+        pass
+
+
+    # =====================================================
     # MÉTODO 3
-    # Cookies sin impersonación
-    # Fallback al método clásico que ya te funcionaba
-    # -----------------------------------------------------
+    # Cookies + navegador móvil iPhone
+    # =====================================================
 
     elif metodo == 3:
+
         opciones["cookiefile"] = "cookies.txt"
+
+        opciones["http_headers"] = {
+
+            "User-Agent": (
+                "Mozilla/5.0 "
+                "(iPhone; CPU iPhone OS 17_6 like Mac OS X) "
+                "AppleWebKit/605.1.15 "
+                "(KHTML, like Gecko) "
+                "Version/17.6 "
+                "Mobile/15E148 "
+                "Safari/604.1"
+            ),
+
+            "Referer": "https://www.tiktok.com/",
+
+            "Accept-Language": (
+                "es-MX,es;q=0.9,en;q=0.8"
+            ),
+        }
+
+
+    # =====================================================
+    # MÉTODO 4
+    # API móvil de TikTok
+    #
+    # SOLO se usa si existe TIKTOK_IID.
+    # =====================================================
+
+    elif metodo == 4:
+
+        if not TIKTOK_IID:
+            raise RuntimeError(
+                "No existe TIKTOK_IID"
+            )
+
+        opciones["cookiefile"] = "cookies.txt"
+
+        opciones["extractor_args"] = {
+            "tiktok": {
+                "app_info": [
+                    TIKTOK_IID
+                ]
+            }
+        }
+
 
     return opciones
 
 
+# =========================================================
+# OPCIONES PARA INSTAGRAM
+# =========================================================
+
 def opciones_instagram(nombre_archivo):
 
     return {
-        # Instagram estable:
-        # evita obligar a unir video + audio
+        # Instagram estable.
+        # Evitamos forzar la unión de formatos.
         "format": "best",
 
         "outtmpl": nombre_archivo,
@@ -135,21 +239,31 @@ def opciones_instagram(nombre_archivo):
 
 def descargar_con_ytdlp(url, nombre_archivo):
 
-    # -----------------------------------------------------
+    # =====================================================
     # TIKTOK
-    # -----------------------------------------------------
+    # =====================================================
 
     if es_tiktok(url):
 
         ultimo_error = None
 
-        # Intentamos tres métodos distintos
-        for metodo in (1, 2, 3):
+        metodos = [1, 2, 3]
+
+        # Si algún día agregas un IID real,
+        # automáticamente activa el cuarto método.
+        if TIKTOK_IID:
+            metodos.append(4)
+
+
+        for metodo in metodos:
 
             try:
 
+                # Limpiamos restos del intento anterior.
+                limpiar_temporales(nombre_archivo)
+
                 print(
-                    f"TikTok: intento con método {metodo}"
+                    f"TikTok: intentando método {metodo}"
                 )
 
                 opciones = opciones_tiktok(
@@ -157,11 +271,25 @@ def descargar_con_ytdlp(url, nombre_archivo):
                     metodo
                 )
 
+
                 with yt_dlp.YoutubeDL(opciones) as ydl:
+
                     ydl.download([url])
 
-                # Si llegó aquí, funcionó
+
+                if not os.path.exists(nombre_archivo):
+
+                    raise RuntimeError(
+                        "yt-dlp terminó pero no creó el archivo"
+                    )
+
+
+                print(
+                    f"TikTok: método {metodo} funcionó"
+                )
+
                 return
+
 
             except Exception as e:
 
@@ -171,30 +299,52 @@ def descargar_con_ytdlp(url, nombre_archivo):
                     f"TikTok método {metodo} falló: {e}"
                 )
 
-                # Pequeña espera antes del siguiente método
+                limpiar_temporales(nombre_archivo)
+
                 time.sleep(2)
 
-        # Fallaron los tres
-        raise ultimo_error
+
+        if ultimo_error:
+
+            raise ultimo_error
 
 
-    # -----------------------------------------------------
+        raise RuntimeError(
+            "TikTok falló en todos los métodos"
+        )
+
+
+    # =====================================================
     # INSTAGRAM
-    # -----------------------------------------------------
+    # =====================================================
 
-    elif es_instagram(url):
+    if es_instagram(url):
+
+        limpiar_temporales(nombre_archivo)
 
         opciones = opciones_instagram(
             nombre_archivo
         )
 
+
         with yt_dlp.YoutubeDL(opciones) as ydl:
+
             ydl.download([url])
+
+
+        if not os.path.exists(nombre_archivo):
+
+            raise RuntimeError(
+                "Instagram no creó el archivo"
+            )
+
 
         return
 
 
-    raise Exception("URL no compatible")
+    raise RuntimeError(
+        "URL no compatible"
+    )
 
 
 # =========================================================
@@ -204,29 +354,42 @@ def descargar_con_ytdlp(url, nombre_archivo):
 @app_web.route("/download", methods=["POST"])
 def download_video():
 
-    data = request.get_json(silent=True)
+    data = request.get_json(
+        silent=True
+    )
+
 
     if not data:
+
         return {
             "error": "No se recibió información"
         }, 400
 
+
     url = data.get("url")
 
+
     if not url:
+
         return {
             "error": "No URL"
         }, 400
 
+
     url = str(url).strip()
 
+
     if not es_link_valido(url):
+
         return {
             "error": "Link no válido"
         }, 400
 
 
-    nombre_archivo = f"{uuid.uuid4()}.mp4"
+    nombre_archivo = (
+        f"{uuid.uuid4()}.mp4"
+    )
+
 
     try:
 
@@ -235,28 +398,32 @@ def download_video():
             nombre_archivo
         )
 
-        if not os.path.exists(nombre_archivo):
-            return {
-                "error": "No se descargó el archivo"
-            }, 500
+
+        if not os.path.exists(
+            nombre_archivo
+        ):
+
+            raise RuntimeError(
+                "No se descargó el archivo"
+            )
 
 
-        # Borrar el archivo DESPUÉS de que Flask lo envíe.
-        # No lo borramos antes porque el Shortcut todavía
-        # necesita recibirlo completo.
+        # El archivo se borra cuando Flask
+        # termine de responder al Shortcut.
 
         @after_this_request
         def borrar_archivo(response):
 
             try:
 
-                if os.path.exists(nombre_archivo):
-                    os.remove(nombre_archivo)
+                limpiar_temporales(
+                    nombre_archivo
+                )
 
             except Exception as e:
 
                 print(
-                    f"No se pudo borrar archivo temporal: {e}"
+                    f"Error limpiando archivo: {e}"
                 )
 
             return response
@@ -264,8 +431,11 @@ def download_video():
 
         return send_file(
             nombre_archivo,
+
             as_attachment=True,
+
             download_name="video.mp4",
+
             mimetype="video/mp4"
         )
 
@@ -276,13 +446,10 @@ def download_video():
             f"Error /download: {e}"
         )
 
-        if os.path.exists(nombre_archivo):
+        limpiar_temporales(
+            nombre_archivo
+        )
 
-            try:
-                os.remove(nombre_archivo)
-
-            except Exception:
-                pass
 
         return {
             "error": str(e)
@@ -298,7 +465,18 @@ async def descargar_video(
     context: ContextTypes.DEFAULT_TYPE
 ):
 
-    mensaje = update.message.text.strip()
+    if not update.message:
+        return
+
+
+    if not update.message.text:
+        return
+
+
+    mensaje = (
+        update.message.text.strip()
+    )
+
 
     if not es_link_valido(mensaje):
 
@@ -309,21 +487,26 @@ async def descargar_video(
         return
 
 
-    # Esto hace que si mandas varios enlaces,
-    # se procesen ordenadamente y no se pisen.
-
     async with cola_descargas:
 
-        esperando = await update.message.reply_text(
-            "⏳ Descargando video..."
+
+        esperando = (
+            await update.message.reply_text(
+                "⏳ Descargando video..."
+            )
         )
 
-        nombre_archivo = f"{uuid.uuid4()}.mp4"
+
+        nombre_archivo = (
+            f"{uuid.uuid4()}.mp4"
+        )
+
 
         try:
 
-            # yt-dlp es bloqueante, así que lo mandamos
-            # a un thread para no congelar Telegram.
+            # yt-dlp es bloqueante.
+            # Lo ejecutamos aparte para no
+            # congelar Telegram.
 
             await asyncio.to_thread(
                 descargar_con_ytdlp,
@@ -332,14 +515,19 @@ async def descargar_video(
             )
 
 
-            if not os.path.exists(nombre_archivo):
+            if not os.path.exists(
+                nombre_archivo
+            ):
 
-                raise Exception(
+                raise RuntimeError(
                     "No se descargó el archivo"
                 )
 
 
-            with open(nombre_archivo, "rb") as video:
+            with open(
+                nombre_archivo,
+                "rb"
+            ) as video:
 
                 await update.message.reply_video(
                     video=video,
@@ -356,24 +544,27 @@ async def descargar_video(
                 f"Error Telegram: {e}"
             )
 
-            await esperando.edit_text(
-                "❌ No pude descargar ese video."
-            )
+
+            try:
+
+                await esperando.edit_text(
+                    "❌ No pude descargar ese video."
+                )
+
+            except Exception:
+
+                pass
 
 
         finally:
 
-            if os.path.exists(nombre_archivo):
-
-                try:
-                    os.remove(nombre_archivo)
-
-                except Exception:
-                    pass
+            limpiar_temporales(
+                nombre_archivo
+            )
 
 
 # =========================================================
-# SERVIDOR FLASK
+# SERVIDOR WEB
 # =========================================================
 
 def iniciar_web():
@@ -385,15 +576,17 @@ def iniciar_web():
         )
     )
 
+
     app_web.run(
         host="0.0.0.0",
         port=puerto,
-        threaded=True
+        threaded=True,
+        use_reloader=False
     )
 
 
 # =========================================================
-# BOT
+# BOT TELEGRAM
 # =========================================================
 
 def main():
@@ -401,7 +594,7 @@ def main():
     if not TOKEN:
 
         raise RuntimeError(
-            "Falta la variable de entorno BOT_TOKEN"
+            "Falta la variable BOT_TOKEN"
         )
 
 
@@ -421,7 +614,6 @@ def main():
             & ~filters.COMMAND,
 
             descargar_video
-
         )
 
     )
@@ -447,5 +639,6 @@ if __name__ == "__main__":
         target=iniciar_web,
         daemon=True
     ).start()
+
 
     main()
