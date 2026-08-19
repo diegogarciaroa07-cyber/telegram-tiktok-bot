@@ -1,6 +1,5 @@
 python-telegram-bot
-yt-dlp
-curl_cffi
+yt-dlp[default,curl-cffi]
 flask
 requests
 gunicorn
