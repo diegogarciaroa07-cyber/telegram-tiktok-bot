@@ -1,5 +1,6 @@
 python-telegram-bot
 yt-dlp
+curl_cffi
 flask
 requests
 gunicorn
