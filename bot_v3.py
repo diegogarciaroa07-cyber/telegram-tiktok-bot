@@ -1,4 +1,5 @@
 import base64
+import os
 import re
 from urllib.parse import parse_qs, urlparse, urlunparse
 
@@ -125,7 +126,6 @@ def _story_media_id_query(url):
 
 
 def _mejor_imagen(item):
-    # Respuesta de la API móvil de Instagram
     candidatos = ((item.get("image_versions2") or {}).get("candidates") or [])
     if candidatos:
         mejor = max(
@@ -135,7 +135,6 @@ def _mejor_imagen(item):
         if mejor.get("url"):
             return mejor["url"]
 
-    # Respuesta GraphQL de Instaloader
     recursos = item.get("display_resources") or []
     if recursos:
         mejor = max(
@@ -150,7 +149,6 @@ def _mejor_imagen(item):
 
 
 def _mejor_video(item):
-    # Respuesta de la API móvil de Instagram
     versiones = item.get("video_versions") or []
     if versiones:
         mejor = max(
@@ -163,7 +161,6 @@ def _mejor_video(item):
         if mejor.get("url"):
             return mejor["url"]
 
-    # Respuesta GraphQL de Instaloader
     recursos = item.get("video_resources") or []
     if recursos:
         mejor = max(
@@ -191,16 +188,11 @@ def _id_item(item):
 
 
 def _obtener_items_highlight(highlight_id):
-    """
-    Usa la propia sesión HTTP de Instaloader. Esto es importante porque
-    Instagram exige cabeceras/dispositivo de sesión además de las cookies.
-    """
     loader = None
     try:
         loader, cookies = bot_v2.crear_instaloader()
         clave = f"highlight:{highlight_id}"
 
-        # Método principal: endpoint iPhone de Instaloader.
         try:
             data = loader.context.get_iphone_json(
                 path=f"api/v1/feed/reels_media/?reel_ids={clave}",
@@ -217,7 +209,6 @@ def _obtener_items_highlight(highlight_id):
         except Exception as e:
             print(f"Instagram Highlight: API móvil falló: {e}", flush=True)
 
-        # Fallback: misma consulta GraphQL que usa Highlight._fetch_items().
         try:
             data = loader.context.graphql_query(
                 "45246d3fe16ccc6577e0bd297a5db1ab",
@@ -253,6 +244,11 @@ def descargar_highlight(url, directorio):
     highlight_id = _highlight_id(url)
     if not highlight_id:
         raise RuntimeError("No pude identificar la historia destacada")
+
+    # A diferencia de posts/reels normales, el highlight entra por esta ruta
+    # antes de pasar por bot_v2.descargar_instagram(), así que debemos crear
+    # aquí su carpeta temporal.
+    os.makedirs(directorio, exist_ok=True)
 
     print(f"Instagram Highlight: id={highlight_id}", flush=True)
     items, cookies = _obtener_items_highlight(highlight_id)
@@ -303,10 +299,8 @@ def descargar_instagram(url, directorio):
     return _original_descargar_instagram(url_resuelta, directorio)
 
 
-# Monkey-patch controlado: mantenemos intacta la lógica estable de bot_v2.
 bot_v2.es_instagram = es_instagram
 bot_v2.descargar_instagram = descargar_instagram
 
-# Reexportamos lo que usa bot.py
 main = bot_v2.main
 iniciar_web = bot_v2.iniciar_web
