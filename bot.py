@@ -1,6 +1,6 @@
 # Punto de entrada estable.
-# La versión anterior queda guardada en el historial de Git.
-from bot_v2 import main, iniciar_web
+# bot_v3 añade soporte para links compartidos de Instagram sin tocar la lógica estable anterior.
+from bot_v3 import main, iniciar_web
 import threading
 
 if __name__ == "__main__":
