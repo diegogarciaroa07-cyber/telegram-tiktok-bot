@@ -1,6 +1,6 @@
 # Punto de entrada estable.
-# bot_v4 corrige Stories normales usando el media ID directo.
-from bot_v4 import main, iniciar_web
+# bot_v5 mantiene Reels/publicaciones y pausa Stories/Highlights temporalmente.
+from bot_v5 import main, iniciar_web
 import threading
 
 if __name__ == "__main__":
