@@ -8,7 +8,7 @@ import bot_v2
 
 
 # =========================================================
-# COMPATIBILIDAD CON LINKS COMPARTIDOS / DESTACADAS DE IG
+# COMPATIBILIDAD CON LINKS COMPARTIDOS / STORIES / DESTACADAS
 # =========================================================
 
 _original_descargar_instagram = bot_v2.descargar_instagram
@@ -117,6 +117,27 @@ def _highlight_id(url):
     return m.group(1) if m else None
 
 
+def _es_story_normal(url):
+    return bool(
+        re.search(
+            r"instagram\.com/stories/(?!highlights(?:/|$))([^/?#]+)/(\d+)",
+            str(url or ""),
+            re.I,
+        )
+    )
+
+
+def _story_normal_partes(url):
+    m = re.search(
+        r"instagram\.com/stories/(?!highlights(?:/|$))([^/?#]+)/(\d+)",
+        str(url or ""),
+        re.I,
+    )
+    if not m:
+        return None, None
+    return m.group(1), m.group(2)
+
+
 def _story_media_id_query(url):
     try:
         valores = parse_qs(urlparse(url).query).get("story_media_id") or []
@@ -187,6 +208,99 @@ def _id_item(item):
     return str(item.get("pk") or item.get("id") or "").split("_")[0]
 
 
+def _buscar_reel_por_clave(reels, clave):
+    reel = (reels or {}).get(str(clave))
+    if reel:
+        return reel
+    for k, valor in (reels or {}).items():
+        if str(k) == str(clave):
+            return valor
+    return {}
+
+
+# =================== STORIES NORMALES ====================
+
+def _obtener_story_normal(username, media_id):
+    """
+    Obtiene una Story normal sin usar StoryItem.from_mediaid(). Ese método
+    depende de una consulta GraphQL antigua que Instagram está rechazando con
+    feedback_required. Aquí resolvemos usuario -> ID y luego usamos reels_media.
+    """
+    loader = None
+    try:
+        loader, cookies = bot_v2.crear_instaloader()
+
+        perfil = loader.context.get_json(
+            "api/v1/users/web_profile_info/",
+            params={"username": str(username).lower()},
+        )
+        user = ((perfil.get("data") or {}).get("user") or {})
+        user_id = str(user.get("id") or user.get("pk") or "")
+        if not user_id:
+            raise RuntimeError("Instagram no devolvió el ID del usuario de la historia")
+
+        print(
+            f"Instagram Story: @{username} user_id={user_id} media_id={media_id}",
+            flush=True,
+        )
+
+        data = loader.context.get_iphone_json(
+            path=f"api/v1/feed/reels_media/?reel_ids={user_id}",
+            params={},
+        )
+        reel = _buscar_reel_por_clave(data.get("reels") or {}, user_id)
+        items = reel.get("items") or []
+        print(
+            f"Instagram Story: API móvil devolvió {len(items)} historia(s) activa(s)",
+            flush=True,
+        )
+
+        objetivo = None
+        for item in items:
+            if _id_item(item) == str(media_id):
+                objetivo = item
+                break
+
+        if objetivo is None:
+            raise RuntimeError(
+                "No encontré esa historia entre las historias activas; puede haber expirado o sido eliminada"
+            )
+
+        return objetivo, cookies
+    finally:
+        if loader is not None:
+            try:
+                loader.close()
+            except Exception:
+                pass
+
+
+def descargar_story_normal(url, directorio):
+    username, media_id = _story_normal_partes(url)
+    if not username or not media_id:
+        raise RuntimeError("No pude identificar la historia")
+
+    os.makedirs(directorio, exist_ok=True)
+    item, cookies = _obtener_story_normal(username, media_id)
+
+    if _item_es_video(item):
+        media_url = _mejor_video(item)
+        if not media_url:
+            raise RuntimeError("Instagram no devolvió el video de la historia")
+        archivo = bot_v2.guardar_media(media_url, True, 1, directorio, cookies)
+        print("Instagram Story: video descargado", flush=True)
+    else:
+        media_url = _mejor_imagen(item)
+        if not media_url:
+            raise RuntimeError("Instagram no devolvió la foto de la historia")
+        archivo = bot_v2.guardar_media(media_url, False, 1, directorio, cookies)
+        print("Instagram Story: foto descargada", flush=True)
+
+    return [archivo]
+
+
+# =================== HISTORIAS DESTACADAS =================
+
 def _obtener_items_highlight(highlight_id):
     loader = None
     try:
@@ -198,7 +312,7 @@ def _obtener_items_highlight(highlight_id):
                 path=f"api/v1/feed/reels_media/?reel_ids={clave}",
                 params={},
             )
-            reel = (data.get("reels") or {}).get(clave) or {}
+            reel = _buscar_reel_por_clave(data.get("reels") or {}, clave)
             items = reel.get("items") or []
             print(
                 f"Instagram Highlight: API móvil devolvió {len(items)} elemento(s)",
@@ -245,9 +359,6 @@ def descargar_highlight(url, directorio):
     if not highlight_id:
         raise RuntimeError("No pude identificar la historia destacada")
 
-    # A diferencia de posts/reels normales, el highlight entra por esta ruta
-    # antes de pasar por bot_v2.descargar_instagram(), así que debemos crear
-    # aquí su carpeta temporal.
     os.makedirs(directorio, exist_ok=True)
 
     print(f"Instagram Highlight: id={highlight_id}", flush=True)
@@ -295,6 +406,9 @@ def descargar_instagram(url, directorio):
 
     if _es_highlight(url_resuelta):
         return descargar_highlight(url_resuelta, directorio)
+
+    if _es_story_normal(url_resuelta):
+        return descargar_story_normal(url_resuelta, directorio)
 
     return _original_descargar_instagram(url_resuelta, directorio)
 
