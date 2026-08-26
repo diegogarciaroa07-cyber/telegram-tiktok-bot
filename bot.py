@@ -1,6 +1,6 @@
 # Punto de entrada estable.
-# bot_v3 añade soporte para links compartidos de Instagram sin tocar la lógica estable anterior.
-from bot_v3 import main, iniciar_web
+# bot_v4 corrige Stories normales usando el media ID directo.
+from bot_v4 import main, iniciar_web
 import threading
 
 if __name__ == "__main__":
