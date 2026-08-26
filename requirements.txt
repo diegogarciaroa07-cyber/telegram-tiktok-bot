@@ -1,5 +1,5 @@
 python-telegram-bot
-yt-dlp[default,curl-cffi]
+yt-dlp[default,curl-cffi]==2026.08.19
 flask
 requests
 gunicorn
