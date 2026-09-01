@@ -1,6 +1,6 @@
 # Punto de entrada estable.
-# bot_v5 mantiene Reels/publicaciones y pausa Stories/Highlights temporalmente.
-from bot_v5 import main, iniciar_web
+# bot_v6 mantiene Instagram en modo seguro y añade recuperación de TikTok.
+from bot_v6 import main, iniciar_web
 import threading
 
 if __name__ == "__main__":
