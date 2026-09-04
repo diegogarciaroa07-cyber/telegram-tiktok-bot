@@ -158,17 +158,25 @@ def _perfiles_player(item):
         width = int(play.get("width") or 0)
         height = int(play.get("height") or 0)
         bitrate = int(perfil.get("bitrate") or 0)
+        data_size = int(play.get("data_size") or 0)
         perfiles.append({
             "urls": urls,
             "codec": codec,
+            "width": width,
+            "height": height,
             "pixels": width * height,
             "bitrate": bitrate,
+            "data_size": data_size,
         })
 
-    h264 = [p for p in perfiles if "h264" in p["codec"] or "avc" in p["codec"]]
-    candidatos = h264 or perfiles
-    candidatos.sort(key=lambda p: (p["pixels"], p["bitrate"]), reverse=True)
-    return candidatos
+    # Máxima calidad real: primero resolución, después bitrate y tamaño.
+    # No se limita a H.264; HEVC/H.265 se conserva cuando TikTok lo ofrece
+    # en una calidad superior.
+    perfiles.sort(
+        key=lambda p: (p["pixels"], p["bitrate"], p["data_size"]),
+        reverse=True,
+    )
+    return perfiles
 
 
 def _descargar_url_player(media_url, video_id, destino):
@@ -246,14 +254,30 @@ def descargar_tiktok_player(url, nombre_archivo):
     if not perfiles:
         raise RuntimeError("TikTok Player API no devolvió perfiles de video")
 
+    print("TikTok Player: calidades disponibles", flush=True)
+    for perfil in perfiles:
+        bitrate_kbps = perfil["bitrate"] // 1000 if perfil["bitrate"] else 0
+        print(
+            f"TikTok Player: {perfil['width']}x{perfil['height']} "
+            f"{perfil['codec'] or 'codec desconocido'} {bitrate_kbps} kbps",
+            flush=True,
+        )
+
     limpiar_temporales(nombre_archivo)
     ultimo_error = None
     for perfil in perfiles:
+        bitrate_kbps = perfil["bitrate"] // 1000 if perfil["bitrate"] else 0
+        print(
+            f"TikTok Player: probando {perfil['width']}x{perfil['height']} "
+            f"{perfil['codec'] or 'codec desconocido'} {bitrate_kbps} kbps",
+            flush=True,
+        )
         for media_url in perfil["urls"]:
             try:
                 _descargar_url_player(media_url, video_id, nombre_archivo)
                 print(
-                    f"TikTok Player: funcionó ({perfil['codec'] or 'codec desconocido'})",
+                    f"TikTok Player: descargado {perfil['width']}x{perfil['height']} "
+                    f"{perfil['codec'] or 'codec desconocido'} {bitrate_kbps} kbps",
                     flush=True,
                 )
                 return nombre_archivo
