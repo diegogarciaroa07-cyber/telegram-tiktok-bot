@@ -4,7 +4,8 @@ from telegram.ext import Application, ContextTypes, MessageHandler, filters
 import asyncio
 import html
 import json
-import subprocess
+import struct
+from contextlib import contextmanager
 from urllib.parse import urljoin, urlsplit
 import glob
 import os
@@ -19,6 +20,7 @@ from http.cookiejar import MozillaCookieJar
 import instaloader
 import requests
 import yt_dlp
+from yt_dlp.networking.impersonate import ImpersonateTarget
 from curl_cffi import requests as cffi_requests
 from flask import Flask, after_this_request, request, send_file
 
@@ -159,6 +161,8 @@ def _perfiles_player(item):
             continue
 
         codec = str(perfil.get("codec_type") or "").lower()
+        if codec in ("bytevc2", "h266", "vvc"):
+            continue
         width = int(play.get("width") or 0)
         height = int(play.get("height") or 0)
         bitrate = int(perfil.get("bitrate") or 0)
@@ -173,11 +177,11 @@ def _perfiles_player(item):
             "data_size": data_size,
         })
 
-    # Máxima calidad real: primero resolución, después bitrate y tamaño.
+    # Orden de búsqueda inicial. La selección final mide los archivos.
     # No se limita a H.264; HEVC/H.265 se conserva cuando TikTok lo ofrece
     # en una calidad superior.
     perfiles.sort(
-        key=lambda p: (p["pixels"], p["bitrate"], p["data_size"]),
+        key=lambda p: (p["pixels"], p["bitrate"]),
         reverse=True,
     )
     return perfiles
@@ -196,12 +200,14 @@ def _descargar_url_player(media_url, video_id, destino):
         allow_redirects=True,
         timeout=90,
     )
-    r.raise_for_status()
-
-    with open(destino, "wb") as f:
-        for bloque in r.iter_content(chunk_size=1024 * 1024):
-            if bloque:
-                f.write(bloque)
+    try:
+        r.raise_for_status()
+        with open(destino, "wb") as f:
+            for bloque in r.iter_content(chunk_size=1024 * 1024):
+                if bloque:
+                    f.write(bloque)
+    finally:
+        r.close()
 
     if not _es_mp4_valido(destino):
         try:
@@ -284,9 +290,7 @@ def descargar_tiktok_player(url, nombre_archivo):
                     f"{perfil['codec'] or 'codec desconocido'} {bitrate_kbps} kbps",
                     flush=True,
                 )
-                # El Player no siempre ofrece el archivo de mayor calidad.
-                # La búsqueda adicional solo se realiza cuando su versión es limitada.
-                _comprobar_calidad_alternativa(url, nombre_archivo, perfil)
+                _info_mp4(nombre_archivo)
                 return nombre_archivo
             except Exception as e:
                 ultimo_error = e
@@ -297,7 +301,9 @@ def descargar_tiktok_player(url, nombre_archivo):
 
 def _opciones_tiktok_ytdlp(nombre_archivo, metodo):
     opciones = {
-        "format": "bestvideo+bestaudio/best",
+        "format": "bestvideo[ext=mp4][vcodec!=bytevc2]+bestaudio/best[ext=mp4][vcodec!=bytevc2]",
+        "format_sort": ["res", "fps", "br"],
+        "format_sort_force": True,
         "outtmpl": nombre_archivo,
         "merge_output_format": "mp4",
         "quiet": True,
@@ -306,13 +312,12 @@ def _opciones_tiktok_ytdlp(nombre_archivo, metodo):
         "fragment_retries": 3,
         "extractor_retries": 2,
         "socket_timeout": 30,
+        "noprogress": True,
+        "fixup": "never",
     }
 
     if metodo in (1, 2):
-        opciones["impersonate"] = "chrome"
-
-    if metodo == 2 and os.path.exists(TIKTOK_COOKIEFILE):
-        opciones["cookiefile"] = TIKTOK_COOKIEFILE
+        opciones["impersonate"] = ImpersonateTarget.from_str("chrome")
 
     if metodo == 3:
         iid = TIKTOK_IID or ""
@@ -324,68 +329,261 @@ def _opciones_tiktok_ytdlp(nombre_archivo, metodo):
                 ]
             }
         }
-        if os.path.exists(TIKTOK_COOKIEFILE):
-            opciones["cookiefile"] = TIKTOK_COOKIEFILE
-
     return opciones
+
+
+def _tiktok_ffmpeg():
+    if shutil.which("ffmpeg"):
+        return shutil.which("ffmpeg")
+    try:
+        import imageio_ffmpeg
+        return imageio_ffmpeg.get_ffmpeg_exe()
+    except (ImportError, RuntimeError):
+        return None
+
+
+@contextmanager
+def _abrir_tiktok_ytdlp(opciones, metodo):
+    with yt_dlp.YoutubeDL(opciones) as ydl:
+        # Cargar en memoria: YoutubeDL.close() no debe reescribir cookies.txt.
+        if metodo in (2, 3) and os.path.exists(TIKTOK_COOKIEFILE):
+            jar = MozillaCookieJar(TIKTOK_COOKIEFILE)
+            jar.load(ignore_discard=True, ignore_expires=True)
+            for cookie in jar:
+                ydl.cookiejar.set_cookie(cookie)
+        yield ydl
 
 
 def descargar_tiktok_ytdlp(url, nombre_archivo):
     ultimo_error = None
+    funciono = False
+    base = os.path.splitext(nombre_archivo)[0]
     for metodo in (1, 2, 3):
+        alternativa = f"{base}_ytdlp_{metodo}.mp4"
         try:
-            limpiar_temporales(nombre_archivo)
             print(f"TikTok yt-dlp: método {metodo}", flush=True)
-            with yt_dlp.YoutubeDL(_opciones_tiktok_ytdlp(nombre_archivo, metodo)) as ydl:
-                ydl.download([url])
-            if not os.path.exists(nombre_archivo):
-                raise RuntimeError("yt-dlp terminó pero no creó el archivo")
-            print(f"TikTok yt-dlp: método {metodo} funcionó", flush=True)
-            return nombre_archivo
+            opciones = _opciones_tiktok_ytdlp(alternativa, metodo)
+            ffmpeg = _tiktok_ffmpeg()
+            if ffmpeg:
+                # El merger de yt-dlp usa stream copy, nunca un codificador.
+                opciones["ffmpeg_location"] = ffmpeg
+            else:
+                # MP4 con audio incluido si no hay un muxer instalado. No
+                # transcodificar ni seleccionar video sin audio por accidente.
+                opciones["format"] = "best[ext=mp4][vcodec!=bytevc2][acodec!=none]/best[ext=mp4][vcodec!=bytevc2]"
+            with _abrir_tiktok_ytdlp(opciones, metodo) as ydl:
+                info = ydl.extract_info(url, download=True)
+                if not info or info.get("_type") == "playlist":
+                    raise RuntimeError("La respuesta no es un video individual")
+            _tiktok_conservar_candidata(alternativa, nombre_archivo, f"yt-dlp/{metodo}")
+            funciono = True
         except Exception as e:
             ultimo_error = e
-            print(f"TikTok yt-dlp método {metodo} falló: {e}", flush=True)
-            limpiar_temporales(nombre_archivo)
-            time.sleep(1)
-
+            print(f"TikTok yt-dlp método {metodo} falló: {type(e).__name__}: {e}", flush=True)
+        finally:
+            limpiar_temporales(alternativa)
+    if funciono:
+        return nombre_archivo
     raise ultimo_error or RuntimeError("TikTok falló en todos los métodos")
 
 
 def descargar_tiktok(url, nombre_archivo):
     with cola_tiktok:
+        # Cada fuente usa archivos separados. Un fallo posterior conserva la
+        # mejor descarga válida y nunca borra el archivo que se va a entregar.
+        limpiar_temporales(nombre_archivo)
+        errores = []
         try:
-            return descargar_tiktok_player(url, nombre_archivo)
+            descargar_tiktok_player(url, nombre_archivo)
         except Exception as e:
-            print(f"TikTok Player falló: {e}", flush=True)
+            print(f"TikTok Player falló: {type(e).__name__}: {e}", flush=True)
             limpiar_temporales(nombre_archivo)
-
-        print("TikTok: usando yt-dlp como respaldo", flush=True)
-        return descargar_tiktok_ytdlp(url, nombre_archivo)
+            errores.append("Player no disponible")
+        errores.extend(_comprobar_calidad_alternativa(url, nombre_archivo, None))
+        if not os.path.exists(nombre_archivo):
+            raise RuntimeError("Ninguna fuente entregó un video válido: " + "; ".join(errores))
+        info = _info_mp4(nombre_archivo)
+        if os.path.exists(_tiktok_ruta_calidad(nombre_archivo)):
+            info["source"] = _tiktok_calidad(nombre_archivo).get("source", "Player")
+        else:
+            info["source"] = "Player"
+        info["status"] = "best-accessible"
+        info["warnings"] = errores
+        if min(info["width"], info["height"]) < 1080:
+            info["warnings"].append("No se encontró una versión Full HD accesible")
+        with open(_tiktok_ruta_calidad(nombre_archivo), "w", encoding="utf-8") as file:
+            json.dump(info, file, ensure_ascii=False)
+        print(f"TikTok: mejor accesible {info['width']}x{info['height']}; sin recodificar", flush=True)
+        return nombre_archivo
 
 
 
 def _info_mp4(ruta):
-    """Detalles reales del archivo para no confundir tamaño con calidad."""
-    info = {"bytes": os.path.getsize(ruta), "duration": 0.0, "pixels": 0}
-    try:
-        from mutagen.mp4 import MP4
-        info["duration"] = float(MP4(ruta).info.length or 0)
-    except Exception:
-        pass
-    if shutil.which("ffprobe"):
-        try:
-            result = subprocess.run(
-                ["ffprobe", "-v", "error", "-select_streams", "v:0",
-                 "-show_entries", "stream=width,height", "-of", "json", ruta],
-                check=True, capture_output=True, text=True, timeout=10,
-            )
-            streams = (json.loads(result.stdout).get("streams") or [])
-            if streams:
-                stream = streams[0]
-                info["pixels"] = int(stream.get("width") or 0) * int(stream.get("height") or 0)
-        except Exception:
-            pass
-    return info
+    """Mide las pistas, no el peso del contenedor. No requiere FFmpeg en Render.
+
+    Lee tablas ISO BMFF de MP4/MOV no fragmentados (los archivos de TikTok).
+    Un archivo truncado, cifrado o sin tablas verificables se rechaza; nunca se
+    sustituye un video válido por HTML o por metadatos estimados del servidor.
+    """
+    def cajas(datos, inicio=0, fin=None):
+        fin = len(datos) if fin is None else fin
+        while inicio < fin:
+            if fin - inicio < 8:
+                raise ValueError("Cabecera MP4 incompleta")
+            size, tipo = struct.unpack_from(">I4s", datos, inicio)
+            head = 8
+            if size == 1:
+                if fin - inicio < 16:
+                    raise ValueError("Cabecera MP4 extendida incompleta")
+                size = struct.unpack_from(">Q", datos, inicio + 8)[0]
+                head = 16
+            elif size == 0:
+                size = fin - inicio
+            if size < head or inicio + size > fin:
+                raise ValueError("Caja MP4 truncada")
+            yield tipo, datos[inicio + head:inicio + size]
+            inicio += size
+
+    size = os.path.getsize(ruta)
+    moov = None
+    media_bytes = 0
+    with open(ruta, "rb") as file:
+        pos = 0
+        while pos < size:
+            file.seek(pos)
+            header = file.read(8)
+            if len(header) != 8:
+                raise ValueError("MP4 incompleto")
+            length, tipo = struct.unpack(">I4s", header)
+            head = 8
+            if length == 1:
+                extended = file.read(8)
+                if len(extended) != 8:
+                    raise ValueError("MP4 incompleto")
+                length = struct.unpack(">Q", extended)[0]
+                head = 16
+            elif length == 0:
+                length = size - pos
+            if length < head or pos + length > size:
+                raise ValueError("MP4 truncado")
+            if tipo == b"moov":
+                if length > 64 * 1024 * 1024:
+                    raise ValueError("Tablas MP4 excesivas")
+                moov = file.read(length - head)
+            elif tipo == b"mdat":
+                media_bytes += length - head
+            pos += length
+    if moov is None or not media_bytes:
+        raise ValueError("Faltan pistas o contenido MP4")
+
+    tracks = []
+    for tipo, trak in cajas(moov):
+        if tipo != b"trak":
+            continue
+        mdia = dict(cajas(trak)).get(b"mdia")
+        if mdia is None:
+            continue
+        fields = dict(cajas(mdia))
+        handler = fields.get(b"hdlr", b"")[8:12]
+        if handler not in (b"vide", b"soun"):
+            continue
+        mdhd = fields.get(b"mdhd", b"")
+        version = mdhd[0]
+        offset = 20 if version == 1 else 12
+        timescale = struct.unpack_from(">I", mdhd, offset)[0]
+        duration = struct.unpack_from(">Q" if version == 1 else ">I", mdhd, offset + 4)[0]
+        seconds = duration / timescale if timescale else 0
+        minf = dict(cajas(fields[b"minf"]))
+        table = dict(cajas(minf[b"stbl"]))
+        descriptions = list(cajas(table[b"stsd"], 8))
+        codec, description = descriptions[0]
+        sizes = table[b"stsz"]
+        sample_size, count = struct.unpack_from(">II", sizes, 4)
+        # stts mide el tiempo de las muestras; mdhd puede estar redondeado.
+        timing = table.get(b"stts")
+        if timing is not None:
+            entries = struct.unpack_from(">I", timing, 4)[0]
+            if len(timing) != 8 + entries * 8:
+                raise ValueError("Tabla temporal MP4 incompleta")
+            samples = ticks = 0
+            for n, delta in struct.iter_unpack(">II", timing[8:]):
+                samples += n
+                ticks += n * delta
+            if samples != count:
+                raise ValueError("Número de muestras MP4 inconsistente")
+            seconds = ticks / timescale if timescale else 0
+        if not count or not seconds:
+            raise ValueError("Pista MP4 vacía o fragmentada")
+        if sample_size:
+            total = sample_size * count
+        else:
+            if len(sizes) != 12 + count * 4:
+                raise ValueError("Tabla de muestras incompleta")
+            total = sum(n[0] for n in struct.iter_unpack(">I", sizes[12:]))
+        track = {
+            "type": handler, "codec": codec.decode("ascii", errors="replace"),
+            "duration": seconds, "bitrate": int(total * 8 / seconds),
+            "sample_bytes": total,
+        }
+        if handler == b"vide":
+            track["width"], track["height"] = struct.unpack_from(">HH", description, 24)
+            track["fps"] = count / seconds
+        tracks.append(track)
+    videos = [t for t in tracks if t["type"] == b"vide"]
+    if not videos or sum(t["sample_bytes"] for t in tracks) > media_bytes:
+        raise ValueError("MP4 sin video completo")
+    video = videos[0]
+    if video["codec"] not in ("avc1", "avc3", "hvc1", "hev1", "av01", "vp09"):
+        raise ValueError(f"Códec de video no compatible: {video['codec']}")
+    width, height = video["width"], video["height"]
+    if not width or not height:
+        raise ValueError("Dimensiones MP4 inválidas")
+    return {
+        "bytes": size, "duration": video["duration"],
+        "width": width, "height": height, "pixels": width * height,
+        "codec": video["codec"], "fps": round(video["fps"], 3),
+        "video_bitrate": video["bitrate"],
+        "has_audio": any(t["type"] == b"soun" for t in tracks),
+    }
+
+
+def _tiktok_es_mejor(actual, candidata):
+    """Selección técnica orientativa; ningún bitrate certifica calidad visual.
+
+    Resolución y fps primero; bitrate de VIDEO como desempate. Entre códecs
+    distintos el desempate es una heurística, no una equivalencia perceptual.
+    El tamaño total (audio, carátulas y padding incluidos) nunca decide.
+    """
+    if actual is None:
+        return True
+    if abs(actual["duration"] - candidata["duration"]) > max(0.5, actual["duration"] * 0.02):
+        return False
+    ratio_actual = actual["width"] / actual["height"]
+    ratio_candidata = candidata["width"] / candidata["height"]
+    if abs(ratio_actual / ratio_candidata - 1) > 0.03:
+        return False
+    if actual["has_audio"] and not candidata["has_audio"]:
+        return False
+    # Agrupar fps cercanos evita preferir 30.001 fps frente a 30 por redondeos.
+    key = lambda i: (i["pixels"], round(i["fps"]), i["video_bitrate"])
+    return key(candidata) > key(actual)
+
+
+def _tiktok_conservar_candidata(ruta, destino, fuente):
+    nueva = _info_mp4(ruta)
+    actual = _info_mp4(destino) if os.path.exists(destino) else None
+    elegida = _tiktok_es_mejor(actual, nueva)
+    print(
+        f"TikTok {fuente}: {nueva['width']}x{nueva['height']} {nueva['codec']} "
+        f"{nueva['fps']:g} fps {nueva['video_bitrate'] // 1000} kbps video; "
+        f"{nueva['duration']:.2f}s; elegida={elegida}", flush=True,
+    )
+    if elegida:
+        os.replace(ruta, destino)
+        nueva["source"] = fuente
+        with open(_tiktok_ruta_calidad(destino), "w", encoding="utf-8") as file:
+            json.dump(nueva, file)
+    return elegida
 
 
 def _enlaces_ssstik(html_resultado):
@@ -403,7 +601,7 @@ def _enlaces_ssstik(html_resultado):
                 return
             attrs = dict(attrs)
             href = attrs.get("href") or ""
-            if href:
+            if href and href != "#":
                 self.actual = [href, attrs.get("class") or "", ""]
 
         def handle_data(self, data):
@@ -433,6 +631,8 @@ def _enlaces_ssstik(html_resultado):
         desc = (label + " " + classes + " " + full_url).lower()
         if any(s in desc for s in ("mp3", "audio", "music", "thumbnail", "image")):
             continue
+        if parsed.path in ("/", "/en", "/es"):
+            continue
         if not (
             "download" in desc or "dl" in desc or "without_watermark" in desc
             or host in ("tikcdn.io", "www.tikcdn.io", "ssscdn.io", "www.ssscdn.io")
@@ -443,12 +643,54 @@ def _enlaces_ssstik(html_resultado):
     return [u for _, u in sorted(set(candidates), reverse=True)]
 
 
+def _ssstik_formulario_hd(html_resultado):
+    """El botón HD no es un href: solicita su data-directurl mediante POST."""
+    from html.parser import HTMLParser
+
+    class Formulario(HTMLParser):
+        def __init__(self):
+            super().__init__()
+            self.endpoint = None
+            self.token = None
+
+        def handle_starttag(self, tag, attrs):
+            attrs = dict(attrs)
+            if tag == "input" and attrs.get("name") == "tt":
+                self.token = attrs.get("value")
+            if tag in ("a", "button") and (
+                attrs.get("id") == "hd_download"
+                or "quality-best" in (attrs.get("class") or "").split()
+            ):
+                endpoint = attrs.get("data-directurl") or attrs.get("hx-post")
+                if endpoint:
+                    endpoint = urljoin("https://ssstik.io/", endpoint)
+                    parsed = urlsplit(endpoint)
+                    if parsed.scheme == "https" and parsed.hostname in ("ssstik.io", "www.ssstik.io"):
+                        self.endpoint = endpoint
+
+    form = Formulario()
+    form.feed(html_resultado)
+    return form.endpoint, form.token
+
+
+def _ssstik_url_media_permitida(url):
+    parsed = urlsplit(url)
+    host = (parsed.hostname or "").lower()
+    return parsed.scheme == "https" and (
+        host in ("tikcdn.io", "www.tikcdn.io", "ssscdn.io", "www.ssscdn.io")
+        or host.endswith((".tiktokcdn.com", ".byteoversea.com", ".tokcdn.com"))
+    )
+
+
 def _descargar_ssstik_mejor(url, destino):
     """SSSTik es una fuente no oficial: cualquier fallo preserva el video actual."""
     print("TikTok: consultando SSSTik para comprobar calidad HD", flush=True)
     nombre_base, _ = os.path.splitext(destino)
     alternativa = nombre_base + "_ssstik.mp4"
-    original = _info_mp4(destino)
+    mejoro = False
+    validos = 0
+    hd_accesible = False
+    urls_hd = set()
 
     with cffi_requests.Session() as session:
         token = None
@@ -513,6 +755,44 @@ def _descargar_ssstik_mejor(url, destino):
         )
         response.raise_for_status()
         links = _enlaces_ssstik(response.text)
+        endpoint_hd, token_hd = _ssstik_formulario_hd(response.text)
+        hd_resuelto = False
+        if endpoint_hd and token_hd:
+            headers_hd = {
+                "User-Agent": BROWSER_UA,
+                "Origin": "https://ssstik.io",
+                "Referer": "https://ssstik.io" + pagina_usada,
+                "HX-Request": "true",
+                "HX-Current-URL": "https://ssstik.io" + pagina_usada,
+                "HX-Target": "hd_download",
+                "HX-Trigger": "hd_download",
+            }
+            try:
+                for intento in range(3):
+                    hd = session.post(
+                        endpoint_hd, data={"tt": token_hd}, headers=headers_hd,
+                        impersonate="chrome", timeout=60,
+                    )
+                    hd.raise_for_status()
+                    # HTMX comunica la URL en una cabecera, no en el HTML.
+                    redirect = hd.headers.get("HX-Redirect")
+                    enlaces_hd = _enlaces_ssstik(hd.text)
+                    if redirect and _ssstik_url_media_permitida(redirect):
+                        enlaces_hd.insert(0, redirect)
+                    if enlaces_hd:
+                        urls_hd.update(enlaces_hd)
+                        links = enlaces_hd + links
+                        hd_resuelto = True
+                        break
+                    evento = hd.headers.get("HX-Trigger", "").lower()
+                    if any(e in evento for e in ("fail", "fakehd", "limit")):
+                        break
+                    if intento < 2:
+                        time.sleep(2)
+            except Exception as e:
+                print(f"TikTok SSSTik HD: {type(e).__name__}: {e}", flush=True)
+        if not hd_resuelto:
+            print("TikTok SSSTik: HD no accesible; se comprobarán los enlaces normales", flush=True)
         if not links:
             print(
                 f"TikTok SSSTik: respuesta sin videos, "
@@ -521,149 +801,79 @@ def _descargar_ssstik_mejor(url, destino):
             )
             raise RuntimeError("SSSTik no devolvió enlaces de video")
 
-        for media_url in links[:4]:
+        for media_url in dict.fromkeys(links):
             limpiar_temporales(alternativa)
             try:
                 # curl_cffi Response no admite "with": cerrarla explícitamente.
                 stream = session.get(
-                    media_url, impersonate="chrome", stream=True, timeout=75,
+                    media_url, impersonate="chrome", stream=True, timeout=180,
                     headers={"User-Agent": BROWSER_UA, "Referer": "https://ssstik.io/"},
                 )
                 try:
                     stream.raise_for_status()
-                    size = int(stream.headers.get("Content-Length") or 0)
-                    if size > 120 * 1024 * 1024:
-                        raise RuntimeError("SSSTik devolvió un archivo demasiado grande")
-                    total = 0
                     with open(alternativa, "wb") as file:
                         for block in stream.iter_content(chunk_size=1024 * 1024):
                             if not block:
                                 continue
-                            total += len(block)
-                            if total > 120 * 1024 * 1024:
-                                raise RuntimeError("Archivo de SSSTik demasiado grande")
                             file.write(block)
                 finally:
                     stream.close()
                 if not _es_mp4_valido(alternativa):
                     raise RuntimeError("SSSTik no entregó un MP4 válido")
-                other = _info_mp4(alternativa)
-                print(
-                    f"TikTok: comparación Player={original['bytes']} bytes; "
-                    f"SSSTik={other['bytes']} bytes; "
-                    f"duraciones={original['duration']:.1f}/{other['duration']:.1f}s",
-                    flush=True,
-                )
-                if original["duration"] and other["duration"]:
-                    if abs(original["duration"] - other["duration"]) > max(
-                        2.0, original["duration"] * 0.05
-                    ):
-                        continue
-                if original["pixels"] and other["pixels"]:
-                    # Una resolución un poco inferior puede conservar más detalle
-                    # cuando el bitrate de la versión del Player es muy bajo.
-                    if other["pixels"] < original["pixels"] * 0.75:
-                        continue
-                # El tamaño por sí solo no prueba calidad. Solo se reemplaza
-                # cuando la diferencia es sustancial y el video corresponde.
-                if other["bytes"] > original["bytes"] * 1.35:
-                    os.replace(alternativa, destino)
-                    print("TikTok: SSSTik entregó un MP4 mayor; se eligió esa fuente", flush=True)
-                    return True
+                elegida = _tiktok_conservar_candidata(alternativa, destino, "SSSTik")
+                validos += 1
+                hd_accesible = hd_accesible or media_url in urls_hd
+                mejoro = mejoro or elegida
             except Exception as e:
                 print(f"TikTok: enlace SSSTik no utilizable: {e}", flush=True)
             finally:
                 limpiar_temporales(alternativa)
-    return False
+    if not validos:
+        raise RuntimeError("SSSTik no entregó ningún video verificable")
+    return {"mejoro": mejoro, "hd_accesible": hd_accesible}
 
 
-def _comprobar_calidad_alternativa(url, nombre_archivo, perfil_player):
-    """Busca una versión superior sin comprometer el MP4 ya descargado."""
-    pixels_player = int(perfil_player.get("pixels") or 0)
-    bitrate_player = int(perfil_player.get("bitrate") or 0)
-
-    # No aumentar peticiones cuando el Player ya ofrece una versión HD razonable.
-    if pixels_player >= 1080 * 1920 and bitrate_player >= 1_200_000:
-        return
-
-    print(
-        "TikTok: comprobando otra fuente por calidad insuficiente del Player",
-        flush=True,
-    )
+def _comprobar_calidad_alternativa(url, nombre_archivo, perfil_player=None):
+    """Consultar siempre todas las fuentes; 1080p no es un techo de calidad."""
+    errores = []
+    if not _tiktok_ffmpeg():
+        errores.append("FFmpeg no disponible para combinar pistas separadas")
     try:
-        if _descargar_ssstik_mejor(url, nombre_archivo):
-            return
+        estado = _descargar_ssstik_mejor(url, nombre_archivo)
+        if not estado["hd_accesible"]:
+            errores.append("SSSTik HD no disponible")
     except Exception as e:
-        print(f"TikTok: SSSTik no disponible: {e}", flush=True)
+        print(f"TikTok SSSTik: {type(e).__name__}: {e}", flush=True)
+        errores.append("SSSTik no disponible")
+    try:
+        descargar_tiktok_ytdlp(url, nombre_archivo)
+    except Exception as e:
+        print(f"TikTok yt-dlp: {type(e).__name__}: {e}", flush=True)
+        errores.append("yt-dlp no disponible")
+    return errores
 
-    base, _ = os.path.splitext(nombre_archivo)
-    patron_alternativo = f"{base}_alternativa.%(ext)s"
-    ruta_alternativa = f"{base}_alternativa.mp4"
 
-    # Se mantienen los métodos ya existentes, sin cambiar las credenciales ni
-    # el método estable del Player. Un error deja intacto el archivo original.
-    for metodo in (1, 2, 3):
-        opciones = _opciones_tiktok_ytdlp(nombre_archivo, metodo)
-        opciones.update({
-            "format": "best[ext=mp4][acodec!=none]",
-            "format_sort": ["res", "br"],
-            "format_sort_force": True,
-            "outtmpl": patron_alternativo,
-            "retries": 1,
-            "fragment_retries": 1,
-            "extractor_retries": 1,
-            "socket_timeout": 15,
-            "noprogress": True,
-            "quiet": True,
-        })
+def _tiktok_ruta_calidad(ruta):
+    return os.path.splitext(ruta)[0] + "_calidad.json"
 
-        try:
-            with yt_dlp.YoutubeDL(opciones) as ydl:
-                info = ydl.extract_info(url, download=False)
-                if not info or info.get("_type") == "playlist":
-                    continue
-                # Solo se aceptan archivos con video y audio juntos, sin
-                # recomprimir ni depender de FFmpeg.
-                if info.get("requested_formats"):
-                    continue
 
-                width = int(info.get("width") or 0)
-                height = int(info.get("height") or 0)
-                pixels = width * height
-                bitrate = int(float(info.get("tbr") or 0) * 1000)
-                es_superior = (
-                    pixels > pixels_player
-                    or (
-                        pixels and pixels == pixels_player
-                        and bitrate_player and bitrate > bitrate_player * 1.3
-                    )
-                )
-                print(
-                    f"TikTok: alternativa {metodo} {width}x{height} "
-                    f"{bitrate // 1000} kbps; superior={es_superior}",
-                    flush=True,
-                )
-                if not es_superior:
-                    continue
+def _tiktok_calidad(ruta):
+    with open(_tiktok_ruta_calidad(ruta), encoding="utf-8") as file:
+        return json.load(file)
 
-                ydl.process_info(info)
-                if not _es_mp4_valido(ruta_alternativa):
-                    raise RuntimeError("La fuente alternativa no entregó un MP4 válido")
 
-                os.replace(ruta_alternativa, nombre_archivo)
-                print(
-                    f"TikTok: calidad mejorada a {width}x{height} "
-                    f"{bitrate // 1000} kbps (yt-dlp método {metodo})",
-                    flush=True,
-                )
-                return
-        except Exception as e:
-            print(f"TikTok: alternativa {metodo} no disponible: {e}", flush=True)
-        finally:
-            # Solo limpia temporales de la alternativa, nunca el Player original.
-            limpiar_temporales(ruta_alternativa)
-
-    print("TikTok: se conserva calidad original del Player", flush=True)
+def _tiktok_caption(ruta):
+    info = _tiktok_calidad(ruta)
+    texto = (
+        f"Video descargado: {info['width']} × {info['height']} · "
+        f"{info['codec']} · {info['fps']:g} fps\n"
+        f"Video: {info['video_bitrate'] // 1000} kbps. Sin recodificar."
+    )
+    if min(info["width"], info["height"]) < 1080:
+        texto += "\nMejor versión accesible; no se encontró Full HD."
+    if info["warnings"]:
+        texto += "\nAlgunas fuentes no ofrecieron una versión superior verificable."
+    return texto
 
 
 # ========================= INSTAGRAM =========================
@@ -879,17 +1089,23 @@ def download_media():
         try:
             descargar_tiktok(url, archivo)
 
-            @after_this_request
-            def borrar_tiktok(response):
-                limpiar_temporales(archivo)
-                return response
-
-            return send_file(
+            info = _tiktok_calidad(archivo)
+            response = send_file(
                 archivo,
                 as_attachment=True,
                 download_name="video.mp4",
                 mimetype="video/mp4",
             )
+            response.headers["X-Video-Width"] = str(info["width"])
+            response.headers["X-Video-Height"] = str(info["height"])
+            response.headers["X-Video-Codec"] = info["codec"]
+            response.headers["X-Video-Bitrate"] = str(info["video_bitrate"])
+            response.headers["X-Video-Quality"] = info["status"]
+            response.headers["X-Video-Limited"] = str(bool(info["warnings"])).lower()
+            # Borrar después de cerrar el stream, también en Windows.
+            response.direct_passthrough = False
+            response.call_on_close(lambda: limpiar_temporales(archivo))
+            return response
         except Exception as e:
             print(f"Error /download TikTok: {e}", flush=True)
             limpiar_temporales(archivo)
@@ -978,19 +1194,39 @@ async def procesar_enlace(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         if es_tiktok(url):
             archivo = f"{uuid.uuid4()}.mp4"
+            descarga_lista = False
             try:
                 await asyncio.to_thread(descargar_tiktok, url, archivo)
-                with open(archivo, "rb") as f:
-                    await update.message.reply_video(
-                        video=f,
-                        caption="Video descargado",
-                        supports_streaming=True,
-                    )
-                await esperando.delete()
+                descarga_lista = True
+                caption = _tiktok_caption(archivo)
+                try:
+                    with open(archivo, "rb") as f:
+                        await update.message.reply_video(
+                            video=f, caption=caption, supports_streaming=True,
+                            read_timeout=120, write_timeout=180,
+                        )
+                except Exception:
+                    # Conservar HEVC y otros originales que Telegram no pueda
+                    # presentar como video; enviar el archivo sin convertirlo.
+                    with open(archivo, "rb") as f:
+                        await update.message.reply_document(
+                            document=f, caption=caption, filename="video.mp4",
+                            disable_content_type_detection=True,
+                            read_timeout=120, write_timeout=180,
+                        )
+                try:
+                    await esperando.delete()
+                except Exception:
+                    pass
             except Exception as e:
                 print(f"Error Telegram TikTok: {e}", flush=True)
                 try:
-                    await esperando.edit_text("No pude descargar ese TikTok.")
+                    mensaje = (
+                        "El video se descargó, pero Telegram no pudo enviarlo. "
+                        "Prueba el mismo enlace con el Atajo de iPhone; se conserva la calidad."
+                        if descarga_lista else "No pude descargar ese TikTok."
+                    )
+                    await esperando.edit_text(mensaje)
                 except Exception:
                     pass
             finally:
