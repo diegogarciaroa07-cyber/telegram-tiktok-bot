@@ -280,6 +280,9 @@ def descargar_tiktok_player(url, nombre_archivo):
                     f"{perfil['codec'] or 'codec desconocido'} {bitrate_kbps} kbps",
                     flush=True,
                 )
+                # El Player no siempre ofrece el archivo de mayor calidad.
+                # La búsqueda adicional solo se realiza cuando su versión es limitada.
+                _comprobar_calidad_alternativa(url, nombre_archivo, perfil)
                 return nombre_archivo
             except Exception as e:
                 ultimo_error = e
@@ -354,6 +357,89 @@ def descargar_tiktok(url, nombre_archivo):
 
         print("TikTok: usando yt-dlp como respaldo", flush=True)
         return descargar_tiktok_ytdlp(url, nombre_archivo)
+
+
+def _comprobar_calidad_alternativa(url, nombre_archivo, perfil_player):
+    """Busca una versión superior sin comprometer el MP4 ya descargado."""
+    pixels_player = int(perfil_player.get("pixels") or 0)
+    bitrate_player = int(perfil_player.get("bitrate") or 0)
+
+    # No aumentar peticiones cuando el Player ya ofrece una versión HD razonable.
+    if pixels_player >= 1080 * 1920 and bitrate_player >= 1_200_000:
+        return
+
+    print(
+        "TikTok: comprobando otra fuente por calidad insuficiente del Player",
+        flush=True,
+    )
+    base, _ = os.path.splitext(nombre_archivo)
+    patron_alternativo = f"{base}_alternativa.%(ext)s"
+    ruta_alternativa = f"{base}_alternativa.mp4"
+
+    # Se mantienen los métodos ya existentes, sin cambiar las credenciales ni
+    # el método estable del Player. Un error deja intacto el archivo original.
+    for metodo in (1, 2, 3):
+        opciones = _opciones_tiktok_ytdlp(nombre_archivo, metodo)
+        opciones.update({
+            "format": "best[ext=mp4][acodec!=none]",
+            "format_sort": ["res", "br"],
+            "format_sort_force": True,
+            "outtmpl": patron_alternativo,
+            "retries": 1,
+            "fragment_retries": 1,
+            "extractor_retries": 1,
+            "socket_timeout": 15,
+            "noprogress": True,
+            "quiet": True,
+        })
+
+        try:
+            with yt_dlp.YoutubeDL(opciones) as ydl:
+                info = ydl.extract_info(url, download=False)
+                if not info or info.get("_type") == "playlist":
+                    continue
+                # Solo se aceptan archivos con video y audio juntos, sin
+                # recomprimir ni depender de FFmpeg.
+                if info.get("requested_formats"):
+                    continue
+
+                width = int(info.get("width") or 0)
+                height = int(info.get("height") or 0)
+                pixels = width * height
+                bitrate = int(float(info.get("tbr") or 0) * 1000)
+                es_superior = (
+                    pixels > pixels_player
+                    or (
+                        pixels and pixels == pixels_player
+                        and bitrate_player and bitrate > bitrate_player * 1.3
+                    )
+                )
+                print(
+                    f"TikTok: alternativa {metodo} {width}x{height} "
+                    f"{bitrate // 1000} kbps; superior={es_superior}",
+                    flush=True,
+                )
+                if not es_superior:
+                    continue
+
+                ydl.process_info(info)
+                if not _es_mp4_valido(ruta_alternativa):
+                    raise RuntimeError("La fuente alternativa no entregó un MP4 válido")
+
+                os.replace(ruta_alternativa, nombre_archivo)
+                print(
+                    f"TikTok: calidad mejorada a {width}x{height} "
+                    f"{bitrate // 1000} kbps (yt-dlp método {metodo})",
+                    flush=True,
+                )
+                return
+        except Exception as e:
+            print(f"TikTok: alternativa {metodo} no disponible: {e}", flush=True)
+        finally:
+            # Solo limpia temporales de la alternativa, nunca el Player original.
+            limpiar_temporales(ruta_alternativa)
+
+    print("TikTok: se conserva calidad original del Player", flush=True)
 
 
 # ========================= INSTAGRAM =========================
