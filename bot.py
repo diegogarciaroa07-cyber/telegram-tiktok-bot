@@ -524,14 +524,16 @@ def _descargar_ssstik_mejor(url, destino):
         for media_url in links[:4]:
             limpiar_temporales(alternativa)
             try:
-                with session.get(
+                # curl_cffi Response no admite "with": cerrarla explícitamente.
+                stream = session.get(
                     media_url, impersonate="chrome", stream=True, timeout=75,
                     headers={"User-Agent": BROWSER_UA, "Referer": "https://ssstik.io/"},
-                ) as stream:
+                )
+                try:
                     stream.raise_for_status()
                     size = int(stream.headers.get("Content-Length") or 0)
                     if size > 120 * 1024 * 1024:
-                        continue
+                        raise RuntimeError("SSSTik devolvió un archivo demasiado grande")
                     total = 0
                     with open(alternativa, "wb") as file:
                         for block in stream.iter_content(chunk_size=1024 * 1024):
@@ -541,6 +543,8 @@ def _descargar_ssstik_mejor(url, destino):
                             if total > 120 * 1024 * 1024:
                                 raise RuntimeError("Archivo de SSSTik demasiado grande")
                             file.write(block)
+                finally:
+                    stream.close()
                 if not _es_mp4_valido(alternativa):
                     raise RuntimeError("SSSTik no entregó un MP4 válido")
                 other = _info_mp4(alternativa)
