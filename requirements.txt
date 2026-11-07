@@ -4,3 +4,4 @@ instaloader
 flask
 requests
 gunicorn
+imageio-ffmpeg==0.8.1
