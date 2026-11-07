@@ -2,6 +2,10 @@ from telegram import Update
 from telegram.ext import Application, ContextTypes, MessageHandler, filters
 
 import asyncio
+import html
+import json
+import subprocess
+from urllib.parse import urljoin, urlsplit
 import glob
 import os
 import re
@@ -359,6 +363,173 @@ def descargar_tiktok(url, nombre_archivo):
         return descargar_tiktok_ytdlp(url, nombre_archivo)
 
 
+
+def _info_mp4(ruta):
+    """Detalles reales del archivo para no confundir tamaño con calidad."""
+    info = {"bytes": os.path.getsize(ruta), "duration": 0.0, "pixels": 0}
+    try:
+        from mutagen.mp4 import MP4
+        info["duration"] = float(MP4(ruta).info.length or 0)
+    except Exception:
+        pass
+    if shutil.which("ffprobe"):
+        try:
+            result = subprocess.run(
+                ["ffprobe", "-v", "error", "-select_streams", "v:0",
+                 "-show_entries", "stream=width,height", "-of", "json", ruta],
+                check=True, capture_output=True, text=True, timeout=10,
+            )
+            streams = (json.loads(result.stdout).get("streams") or [])
+            if streams:
+                stream = streams[0]
+                info["pixels"] = int(stream.get("width") or 0) * int(stream.get("height") or 0)
+        except Exception:
+            pass
+    return info
+
+
+def _enlaces_ssstik(html_resultado):
+    """Extrae exclusivamente enlaces de descarga del HTML devuelto por SSSTik."""
+    from html.parser import HTMLParser
+
+    class Enlaces(HTMLParser):
+        def __init__(self):
+            super().__init__()
+            self.enlaces = []
+            self.actual = None
+
+        def handle_starttag(self, tag, attrs):
+            if tag != "a":
+                return
+            attrs = dict(attrs)
+            href = attrs.get("href") or ""
+            if href:
+                self.actual = [href, attrs.get("class") or "", ""]
+
+        def handle_data(self, data):
+            if self.actual:
+                self.actual[2] += data
+
+        def handle_endtag(self, tag):
+            if tag == "a" and self.actual:
+                self.enlaces.append(self.actual)
+                self.actual = None
+
+    parser = Enlaces()
+    parser.feed(html_resultado)
+    candidates = []
+    for href, classes, label in parser.enlaces:
+        full_url = urljoin("https://ssstik.io/", html.unescape(href))
+        parsed = urlsplit(full_url)
+        host = (parsed.hostname or "").lower()
+        allowed = (
+            host in ("ssstik.io", "www.ssstik.io", "tikcdn.io", "www.tikcdn.io",
+                     "ssscdn.io", "www.ssscdn.io")
+            or host.endswith(".tiktokcdn.com")
+            or host.endswith(".byteoversea.com")
+        )
+        if not allowed or parsed.scheme != "https":
+            continue
+        desc = (label + " " + classes + " " + full_url).lower()
+        if any(s in desc for s in ("mp3", "audio", "music", "thumbnail", "image")):
+            continue
+        if not (
+            "download" in desc or "dl" in desc
+            or host in ("tikcdn.io", "www.tikcdn.io", "ssscdn.io", "www.ssscdn.io")
+        ):
+            continue
+        hd = int(bool(re.search(r"\\bhd\\b|1080|full.hd|high.quality|dlhd", desc)))
+        candidates.append((hd, full_url))
+    return [u for _, u in sorted(set(candidates), reverse=True)]
+
+
+def _descargar_ssstik_mejor(url, destino):
+    """SSSTik es una fuente no oficial: cualquier fallo preserva el video actual."""
+    print("TikTok: consultando SSSTik para comprobar calidad HD", flush=True)
+    nombre_base, _ = os.path.splitext(destino)
+    alternativa = nombre_base + "_ssstik.mp4"
+    original = _info_mp4(destino)
+
+    with cffi_requests.Session() as session:
+        page = session.get(
+            "https://ssstik.io/es", impersonate="chrome",
+            headers={"User-Agent": BROWSER_UA}, timeout=18,
+        )
+        page.raise_for_status()
+        token_match = re.search(
+            r"""tt\\s*:\\s*['"]([A-Za-z0-9_-]+)['"]""", page.text,
+        )
+        if not token_match:
+            raise RuntimeError("SSSTik cambió su formulario (sin token)")
+        response = session.post(
+            "https://ssstik.io/abc?url=dl",
+            data={"id": url, "locale": "es", "tt": token_match.group(1)},
+            headers={
+                "User-Agent": BROWSER_UA,
+                "Origin": "https://ssstik.io",
+                "Referer": "https://ssstik.io/es",
+                "HX-Request": "true",
+                "HX-Current-URL": "https://ssstik.io/es",
+                "HX-Target": "target",
+                "HX-Trigger": "_gcaptcha_pt",
+            },
+            impersonate="chrome", timeout=25,
+        )
+        response.raise_for_status()
+        links = _enlaces_ssstik(response.text)
+        if not links:
+            raise RuntimeError("SSSTik no devolvió enlaces de video")
+
+        for media_url in links[:4]:
+            limpiar_temporales(alternativa)
+            try:
+                with session.get(
+                    media_url, impersonate="chrome", stream=True, timeout=75,
+                    headers={"User-Agent": BROWSER_UA, "Referer": "https://ssstik.io/"},
+                ) as stream:
+                    stream.raise_for_status()
+                    size = int(stream.headers.get("Content-Length") or 0)
+                    if size > 120 * 1024 * 1024:
+                        continue
+                    total = 0
+                    with open(alternativa, "wb") as file:
+                        for block in stream.iter_content(chunk_size=1024 * 1024):
+                            if not block:
+                                continue
+                            total += len(block)
+                            if total > 120 * 1024 * 1024:
+                                raise RuntimeError("Archivo de SSSTik demasiado grande")
+                            file.write(block)
+                if not _es_mp4_valido(alternativa):
+                    raise RuntimeError("SSSTik no entregó un MP4 válido")
+                other = _info_mp4(alternativa)
+                print(
+                    f"TikTok: comparación Player={original['bytes']} bytes; "
+                    f"SSSTik={other['bytes']} bytes; "
+                    f"duraciones={original['duration']:.1f}/{other['duration']:.1f}s",
+                    flush=True,
+                )
+                if original["duration"] and other["duration"]:
+                    if abs(original["duration"] - other["duration"]) > max(
+                        2.0, original["duration"] * 0.05
+                    ):
+                        continue
+                if original["pixels"] and other["pixels"]:
+                    if other["pixels"] < original["pixels"]:
+                        continue
+                # El tamaño por sí solo no prueba calidad. Solo se reemplaza
+                # cuando la diferencia es sustancial y el video corresponde.
+                if other["bytes"] > original["bytes"] * 1.35:
+                    os.replace(alternativa, destino)
+                    print("TikTok: SSSTik entregó un MP4 mayor; se eligió esa fuente", flush=True)
+                    return True
+            except Exception as e:
+                print(f"TikTok: enlace SSSTik no utilizable: {e}", flush=True)
+            finally:
+                limpiar_temporales(alternativa)
+    return False
+
+
 def _comprobar_calidad_alternativa(url, nombre_archivo, perfil_player):
     """Busca una versión superior sin comprometer el MP4 ya descargado."""
     pixels_player = int(perfil_player.get("pixels") or 0)
@@ -372,6 +543,12 @@ def _comprobar_calidad_alternativa(url, nombre_archivo, perfil_player):
         "TikTok: comprobando otra fuente por calidad insuficiente del Player",
         flush=True,
     )
+    try:
+        if _descargar_ssstik_mejor(url, nombre_archivo):
+            return
+    except Exception as e:
+        print(f"TikTok: SSSTik no disponible: {e}", flush=True)
+
     base, _ = os.path.splitext(nombre_archivo)
     patron_alternativo = f"{base}_alternativa.%(ext)s"
     ruta_alternativa = f"{base}_alternativa.mp4"
