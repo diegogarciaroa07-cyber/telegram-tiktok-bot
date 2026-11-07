@@ -434,7 +434,7 @@ def _enlaces_ssstik(html_resultado):
         if any(s in desc for s in ("mp3", "audio", "music", "thumbnail", "image")):
             continue
         if not (
-            "download" in desc or "dl" in desc
+            "download" in desc or "dl" in desc or "without_watermark" in desc
             or host in ("tikcdn.io", "www.tikcdn.io", "ssscdn.io", "www.ssscdn.io")
         ):
             continue
@@ -451,33 +451,74 @@ def _descargar_ssstik_mejor(url, destino):
     original = _info_mp4(destino)
 
     with cffi_requests.Session() as session:
-        page = session.get(
-            "https://ssstik.io/es", impersonate="chrome",
-            headers={"User-Agent": BROWSER_UA}, timeout=18,
-        )
-        page.raise_for_status()
-        token_match = re.search(
-            r"""tt\s*:\s*['"]([A-Za-z0-9_-]+)['"]""", page.text,
-        )
-        if not token_match:
-            raise RuntimeError("SSSTik cambió su formulario (sin token)")
+        token = None
+        endpoint = "abc"
+        pagina_usada = None
+        # SSSTik cambió el bootstrap: en versiones actuales publica
+        # s_tt y s_furl en lugar del antiguo campo "tt:".
+        for path in ("/en", "/", "/es"):
+            try:
+                page = session.get(
+                    "https://ssstik.io" + path,
+                    impersonate="chrome",
+                    headers={
+                        "User-Agent": BROWSER_UA,
+                        "Accept-Language": "en-US,en;q=0.9",
+                        "Referer": "https://ssstik.io/",
+                    },
+                    timeout=15,
+                )
+                page.raise_for_status()
+                token_match = re.search(
+                    r"""(?:s_tt\s*=\s*|tt\s*:\s*)['"]([A-Za-z0-9_-]+)['"]""",
+                    page.text,
+                )
+                print(
+                    f"TikTok SSSTik: página {path} HTTP {page.status_code}, "
+                    f"HTML {len(page.text)} bytes, token={bool(token_match)}",
+                    flush=True,
+                )
+                if token_match:
+                    token = token_match.group(1)
+                    endpoint_match = re.search(
+                        r"""s_furl\s*=\s*['"]([A-Za-z0-9_/-]+)['"]""",
+                        page.text,
+                    )
+                    if endpoint_match:
+                        endpoint = endpoint_match.group(1).strip("/")
+                    pagina_usada = path
+                    break
+            except Exception as e:
+                print(f"TikTok SSSTik: página {path} no disponible: {e}", flush=True)
+
+        if not token:
+            raise RuntimeError(
+                "SSSTik no entregó el token actual de su formulario desde Render"
+            )
+
         response = session.post(
-            "https://ssstik.io/abc?url=dl",
-            data={"id": url, "locale": "es", "tt": token_match.group(1)},
+            "https://ssstik.io/" + endpoint + "?url=dl",
+            data={"id": url, "locale": "en", "tt": token},
             headers={
                 "User-Agent": BROWSER_UA,
                 "Origin": "https://ssstik.io",
-                "Referer": "https://ssstik.io/es",
+                "Referer": "https://ssstik.io" + pagina_usada,
                 "HX-Request": "true",
-                "HX-Current-URL": "https://ssstik.io/es",
+                "HX-Current-URL": "https://ssstik.io" + pagina_usada,
                 "HX-Target": "target",
                 "HX-Trigger": "_gcaptcha_pt",
+                "Content-Type": "application/x-www-form-urlencoded",
             },
             impersonate="chrome", timeout=25,
         )
         response.raise_for_status()
         links = _enlaces_ssstik(response.text)
         if not links:
+            print(
+                f"TikTok SSSTik: respuesta sin videos, "
+                f"HTTP {response.status_code}, HTML {len(response.text)} bytes",
+                flush=True,
+            )
             raise RuntimeError("SSSTik no devolvió enlaces de video")
 
         for media_url in links[:4]:
@@ -515,7 +556,9 @@ def _descargar_ssstik_mejor(url, destino):
                     ):
                         continue
                 if original["pixels"] and other["pixels"]:
-                    if other["pixels"] < original["pixels"]:
+                    # Una resolución un poco inferior puede conservar más detalle
+                    # cuando el bitrate de la versión del Player es muy bajo.
+                    if other["pixels"] < original["pixels"] * 0.75:
                         continue
                 # El tamaño por sí solo no prueba calidad. Solo se reemplaza
                 # cuando la diferencia es sustancial y el video corresponde.
