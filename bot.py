@@ -438,7 +438,7 @@ def _enlaces_ssstik(html_resultado):
             or host in ("tikcdn.io", "www.tikcdn.io", "ssscdn.io", "www.ssscdn.io")
         ):
             continue
-        hd = int(bool(re.search(r"\\bhd\\b|1080|full.hd|high.quality|dlhd", desc)))
+        hd = int(bool(re.search(r"\bhd\b|1080|full.hd|high.quality|dlhd", desc)))
         candidates.append((hd, full_url))
     return [u for _, u in sorted(set(candidates), reverse=True)]
 
@@ -457,7 +457,7 @@ def _descargar_ssstik_mejor(url, destino):
         )
         page.raise_for_status()
         token_match = re.search(
-            r"""tt\\s*:\\s*['"]([A-Za-z0-9_-]+)['"]""", page.text,
+            r"""tt\s*:\s*['"]([A-Za-z0-9_-]+)['"]""", page.text,
         )
         if not token_match:
             raise RuntimeError("SSSTik cambió su formulario (sin token)")
