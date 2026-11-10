@@ -1,5 +1,53 @@
 # Validación de calidad de TikTok
 
+## Propuesta posterior: trabajos temporales para el Atajo de iPhone
+
+Estado: implementada y probada localmente en `codex/iphone-download-jobs`; todavía sin publicar en Render. Las rutas siguientes no deben usarse en el Atajo hasta completar el despliegue.
+
+Se conserva el descargador HD íntegro. Las 44 funciones existentes, incluidas las de Instagram, Telegram y `/download`, se compararon por AST con `main` y permanecen idénticas. Solo se añaden rutas para TikTok y un trabajador temporal en el mismo proceso Python; no se añade otro servicio ni dependencia.
+
+### Contrato para Guardar en Fotos
+
+Base de producción, después de publicar: `https://telegram-tiktok-bot-myvf.onrender.com`.
+
+1. `POST /tiktok/jobs`, cuerpo JSON `{"url":"ENLACE_TIKTOK"}`. Devuelve HTTP 202 con `job_id`, `status` y `status_url` HTTPS. No resuelve el enlace ni descarga antes de responder. `request_id` es opcional y permite identificar reintentos; el mismo enlace exacto también reutiliza un trabajo pendiente o listo. Si no hay capacidad responde HTTP 200 con `status: "busy"`, `error` y `retry_after: 3`; el Atajo debe mostrar el mensaje y no intentar leer una URL que no existe.
+2. `GET status_url`. Devuelve HTTP 200 con `status`: `queued`, `processing`, `ready`, `failed` o `expired`. Los estados pendientes incluyen `retry_after: 3`; los fallos/caducidad incluyen `error`. `ready` añade `download_url`, `quality` y `expires_in` en segundos. Un trabajo desconocido, incluso tras reiniciar, devuelve `expired`.
+3. `GET download_url`. Entrega `video/mp4` como `video.mp4`. No prepara el video otra vez ni lo recomprime. Permite descargarlo repetidamente durante su vigencia y soporta HTTP Range. Si aún no está listo devuelve 409; si ya caducó, 410. Las respuestas usan `Cache-Control: no-store`.
+
+Los identificadores aleatorios funcionan como enlaces temporales de acceso al archivo. No se devuelven rutas del servidor, cookies ni detalles internos de errores.
+
+### Cambios en el Atajo, después del despliegue
+
+Mantener la rama de Instagram tal como está. Aplicar lo siguiente solo a enlaces de TikTok:
+
+1. Conservar la obtención del enlace compartido/portapapeles.
+2. Usar **Obtener contenido de URL**, POST a la base más `/tiktok/jobs`, cuerpo de solicitud JSON con clave `url` y el enlace como valor.
+3. Comprobar primero `status`. Ante `busy`, mostrar `error` y detener. Conservar `status_url` mediante **Obtener valor del diccionario**. No repetir el POST dentro del bucle de consulta.
+4. Definir `Listo` como falso. Añadir **Repetir 60 veces**. Dentro, ejecutar las consultas solo **Si Listo es falso**: GET a `status_url`, leer `status`; si es `queued` o `processing`, **Esperar 3 segundos**; si es `ready`, conservar `download_url` y definir `Listo` como verdadero; si es `failed` o `expired`, mostrar `error` y detener el Atajo.
+5. Después del bucle: **Si Listo es verdadero**, GET a `download_url` y pasar directamente el archivo recibido a **Guardar en álbum de fotos**. Si no está listo, mostrar que terminó la espera; conservar el identificador para poder consultar ese trabajo sin volver a prepararlo. El límite es de 60 consultas, no una garantía de tiempo total exacto.
+6. Ejecutar inicialmente desde la app Atajos en primer plano. La preparación en servidor no depende de mantener una sola petición abierta, pero iOS aún puede suspender el Atajo si se deja en segundo plano. No se añade ninguna acción de codificación o conversión de video.
+
+Texto para una IA que ayude a editar, una vez publicadas las rutas:
+
+> Modifica únicamente la rama de TikTok de «Guardar en Fotos». Conserva la obtención del enlace y la rama de Instagram. Haz un POST con JSON {"url": enlace} a https://telegram-tiktok-bot-myvf.onrender.com/tiktok/jobs. Si la respuesta indica busy, muestra su error y detén. Guarda status_url. Usa una variable Listo, inicialmente falsa, y Repetir 60 veces. Solo mientras no esté listo, consulta status_url con GET. Si status es queued o processing, espera 3 segundos; si es ready, guarda download_url y marca Listo verdadero; si es failed o expired, muestra error y detén. Al terminar el bucle, si está listo descarga download_url mediante GET y guarda ese archivo directamente en Fotos. Si no, informa de que terminó la espera. No vuelvas a crear el trabajo dentro del bucle ni conviertas el video. Muéstrame las acciones y variables para revisarlas.
+
+### Validación local de esta propuesta
+
+- **32 pruebas aprobadas**: las 19 anteriores y 13 casos adicionales. Se verifican respuestas rápidas con un trabajador bloqueado, reintentos, cola limitada, errores, URLs inválidas, caducidad, transferencia abierta durante la limpieza, descargas repetidas y peticiones Range.
+- Descarga real del ejemplo a través de las nuevas rutas locales: preparación 19,563 s; creación del trabajo por debajo de la resolución útil de la medición (<0,1 s); peor consulta de estado 0,234 s en 38 consultas; transferencia local 0,062 s.
+- Resultado: 1080 × 1440, HEVC, 30 fps, audio, 6.195.595 bit/s de video y 11.873.409 bytes. SHA-256 `012f76c5d08125275b8ec4421e754cad640cabfc6fdaf6a10cdec8616694bede`, idéntico al HD validado. Segunda descarga del archivo idéntica y decodificación completa con FFmpeg sin errores.
+- Los tiempos son del servidor local con descarga real de Internet. No son tiempos de Render ni una prueba desde el iPhone. La evidencia queda en `.local/evidence/jobs-real-result.json` y `jobs-real-example.mp4`, fuera de Git.
+
+### Límites y comprobaciones antes de darlo por resuelto
+
+Se mantienen como máximo 8 trabajos retenidos, con un único trabajador. El archivo listo dura 10 minutos y los fallos 2 minutos; después se limpian automáticamente. Una transferencia ya abierta puede acabar aunque venza el plazo, pero no se permite iniciar otra con el trabajo caducado. Telegram conserva su misma exclusión de descargas; un trabajo puede esperar mientras Telegram procesa otro TikTok.
+
+El estado y los archivos son temporales y se pierden al reiniciar/desplegar o suspender Render. La primera petición aún puede esperar el arranque del plan gratuito. Esta propuesta requiere mantener la configuración actual de un proceso (`python bot.py`); no es una cola distribuida para varios workers. Dividir las peticiones tampoco elimina un posible timeout al transferir un archivo grande por una conexión lenta ni las restricciones de segundo plano de iOS.
+
+Antes de dar el problema por resuelto: aprobar y publicar en el mismo servicio, medir POST/estado/archivo en Render con servicio activo y tras inactividad, y ejecutar el Atajo real en el iPhone con el ejemplo HD. Comparar bytes/hash y comprobar el guardado en Fotos. La publicación y la prueba en iPhone siguen pendientes.
+
+---
+
 Fecha: 7 de noviembre de 2026 (America/Mexico_City).
 Base analizada: `323d9f593fa4ae1a2166165d28923a41eccbef95` de `main`.
 Estado: propuesta para revisión; sin despliegue en Render.
