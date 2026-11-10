@@ -8,6 +8,9 @@ import json
 import shutil
 import struct
 import subprocess
+import threading
+import time
+from urllib.parse import urlsplit
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import AsyncMock
@@ -15,6 +18,132 @@ from unittest.mock import AsyncMock
 import pytest
 import bot
 from yt_dlp.postprocessor.ffmpeg import FFmpegMergerPP
+
+
+@pytest.fixture
+def job_manager(monkeypatch, media):
+    def download(url, path):
+        shutil.copyfile(media["high"], path)
+        Path(bot._tiktok_ruta_calidad(path)).write_text(json.dumps({"warnings": []}))
+    manager = bot.TrabajosTikTok(download=download)
+    monkeypatch.setattr(bot, "_trabajos_tiktok", manager)
+    yield manager
+    manager.close()
+
+
+def wait_job(manager, job_id):
+    deadline = time.monotonic() + 5
+    while time.monotonic() < deadline:
+        result = manager.snapshot(job_id)
+        if result["status"] not in ("queued", "processing"):
+            return result
+        time.sleep(0.01)
+    raise AssertionError("Worker did not finish")
+
+
+def test_jobs_fast_creation_polling_and_idempotent_retry(job_manager):
+    started, release = threading.Event(), threading.Event()
+    original = job_manager.download
+    def blocked(*args):
+        started.set()
+        assert release.wait(5)
+        original(*args)
+    job_manager.download = blocked
+    try:
+        with bot.app_web.test_client() as c:
+            begin = time.monotonic()
+            r = c.post('/tiktok/jobs', json={'url':'https://vt.tiktok.com/fixture/'})
+            assert time.monotonic() - begin < 1
+            assert r.status_code == 202
+            data = r.json
+            assert data['status'] in ('queued', 'processing')
+            assert data['status_url'].startswith('https://')
+            assert started.wait(1)
+            begin = time.monotonic()
+            s = c.get(urlsplit(data['status_url']).path)
+            assert time.monotonic() - begin < 1
+            assert s.json['status'] == 'processing'
+            retry = c.post('/tiktok/jobs', json={'url':'https://vt.tiktok.com/fixture/'})
+            assert retry.json['job_id'] == data['job_id']
+            assert len(job_manager.jobs) == 1
+            assert c.get(f"/tiktok/jobs/{data['job_id']}/file").status_code == 409
+    finally:
+        release.set()
+        job_manager.pending.join()
+
+
+def test_jobs_file_bytes_retries_ranges_and_expiration(job_manager, media):
+    with bot.app_web.test_client() as c:
+        job_id = c.post('/tiktok/jobs', json={'url':'https://vt.tiktok.com/fixture/'}).json['job_id']
+        assert wait_job(job_manager, job_id)['status'] == 'ready'
+        status = c.get(f'/tiktok/jobs/{job_id}').json
+        assert status['quality']['width'] == 128
+        path = urlsplit(status['download_url']).path
+        for _ in range(2):
+            r = c.get(path)
+            assert r.data == media['high'].read_bytes()
+            assert r.headers['Content-Type'] == 'video/mp4'
+            r.close()
+        r = c.get(path, headers={'Range':'bytes=0-31'})
+        assert r.status_code == 206 and r.data == media['high'].read_bytes()[:32]
+        r.close()
+        # A download already open may finish, but no new reader gets expired data.
+        open_response = c.get(path, buffered=False)
+        directory = Path(job_manager.jobs[job_id]['directory'])
+        with job_manager.lock:
+            job_manager.jobs[job_id]['expires'] = time.monotonic() - 1
+        assert c.get(f'/tiktok/jobs/{job_id}').json['status'] == 'expired'
+        assert c.get(path).status_code == 410
+        job_manager._sweep()
+        assert directory.exists()
+        assert open_response.data == media['high'].read_bytes()
+        open_response.close()
+        job_manager._sweep()
+        assert not directory.exists()
+
+
+def test_jobs_failures_and_restart_are_visible(job_manager):
+    def fail(*args):
+        raise RuntimeError('secret-fixture-should-not-be-returned')
+    job_manager.download = fail
+    job_id, _ = job_manager.create('https://vt.tiktok.com/fixture/')
+    assert wait_job(job_manager, job_id)['status'] == 'failed'
+    with bot.app_web.test_client() as c:
+        r = c.get(f'/tiktok/jobs/{job_id}')
+        assert 'secret-fixture' not in r.get_data(as_text=True)
+        assert c.get('/tiktok/jobs/unknown-after-restart').json['status'] == 'expired'
+        assert c.get('/tiktok/jobs/unknown-after-restart/file').status_code == 410
+
+
+@pytest.mark.parametrize('body', [[], {}, {'url':'https://instagram.com/p/example'},
+    {'url':'https://tiktok.com.evil.example/a'}, {'url':'https://evil.example/?tiktok.com'},
+    {'url':'http://vt.tiktok.com/a'}, {'url':'https://vt.tiktok.com:bad/a'},
+    {'url':'https://vt.tiktok.com/a', 'request_id':[]}, {'url':42}])
+def test_jobs_reject_invalid_inputs_without_downloading(job_manager, body):
+    with bot.app_web.test_client() as c:
+        assert c.post('/tiktok/jobs', json=body).status_code == 400
+    assert not job_manager.jobs
+
+
+def test_jobs_bounded_queue_and_request_id_conflict(job_manager):
+    release = threading.Event()
+    original = job_manager.download
+    job_manager.download = lambda *args: (release.wait(5), original(*args))
+    job_manager.max_jobs = 2
+    try:
+        with bot.app_web.test_client() as c:
+            a = c.post('/tiktok/jobs', json={'url':'https://vt.tiktok.com/a','request_id':'one'}).json
+            b = c.post('/tiktok/jobs', json={'url':'https://vt.tiktok.com/b','request_id':'two'}).json
+            assert a['job_id'] != b['job_id']
+            conflict = c.post('/tiktok/jobs', json={'url':'https://vt.tiktok.com/a','request_id':'two'})
+            assert conflict.status_code == 409
+            full = c.post('/tiktok/jobs', json={'url':'https://vt.tiktok.com/c'})
+            assert full.json['status'] == 'busy'
+            assert full.status_code == 200
+            assert c.get(f"/tiktok/jobs/{b['job_id']}").json['status'] == 'queued'
+    finally:
+        release.set()
+        job_manager.pending.join()
 
 
 @pytest.fixture(scope="session")

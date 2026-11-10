@@ -4,7 +4,9 @@ from telegram.ext import Application, ContextTypes, MessageHandler, filters
 import asyncio
 import html
 import json
+import queue
 import struct
+import tempfile
 from contextlib import contextmanager
 from urllib.parse import urljoin, urlsplit
 import glob
@@ -22,7 +24,7 @@ import requests
 import yt_dlp
 from yt_dlp.networking.impersonate import ImpersonateTarget
 from curl_cffi import requests as cffi_requests
-from flask import Flask, after_this_request, request, send_file
+from flask import Flask, after_this_request, request, send_file, url_for
 
 TOKEN = os.getenv("BOT_TOKEN")
 TIKTOK_IID = os.getenv("TIKTOK_IID")
@@ -1068,6 +1070,210 @@ def mimetype(ruta):
     if ext == ".zip":
         return "application/zip"
     return "application/octet-stream"
+
+
+class TrabajosTikTok:
+    """Cola temporal del único proceso web. Crear/consultar no hace red.
+
+    El trabajador usa el descargador HD y su bloqueo compartido con Telegram.
+    Los trabajos no sobreviven a un reinicio de Render.
+    """
+    def __init__(self, download=None, ready_ttl=600, failed_ttl=120, max_jobs=8):
+        self.download = download or descargar_tiktok
+        self.ready_ttl, self.failed_ttl, self.max_jobs = ready_ttl, failed_ttl, max_jobs
+        self.directory = tempfile.mkdtemp(prefix="tiktok_jobs_")
+        self.lock = threading.RLock()
+        self.jobs, self.garbage = {}, []
+        self.pending = queue.Queue(maxsize=max_jobs)
+        self.stopped = threading.Event()
+        self.worker = threading.Thread(target=self._run, daemon=True, name="tiktok-jobs")
+        self.worker.start()
+
+    def _expire(self):
+        now = time.monotonic()
+        for job_id, job in list(self.jobs.items()):
+            if job["expires"] is not None and now >= job["expires"] and not job["readers"]:
+                self.garbage.append(job["directory"])
+                del self.jobs[job_id]
+
+    def _sweep(self):
+        with self.lock:
+            self._expire()
+            paths, self.garbage = self.garbage, []
+        for path in paths:
+            if os.path.dirname(os.path.abspath(path)) == os.path.abspath(self.directory):
+                shutil.rmtree(path, ignore_errors=True)
+
+    def create(self, url, request_id=None):
+        with self.lock:
+            self._expire()
+            for job_id, job in self.jobs.items():
+                if request_id and request_id in job["request_ids"]:
+                    return (job_id, None) if job["url"] == url else (None, "conflict")
+            for job_id, job in self.jobs.items():
+                if job["url"] == url and job["status"] in ("queued", "processing", "ready"):
+                    if request_id and len(job["request_ids"]) < 32:
+                        job["request_ids"].add(request_id)
+                    return job_id, None
+            if len(self.jobs) >= self.max_jobs:
+                return None, "busy"
+            job_id = uuid.uuid4().hex
+            directory = os.path.join(self.directory, job_id)
+            self.jobs[job_id] = {
+                "url": url, "status": "queued", "directory": directory,
+                "path": os.path.join(directory, "video.mp4"),
+                "request_ids": {request_id} if request_id else set(),
+                "expires": None, "readers": 0, "quality": None,
+            }
+            self.pending.put_nowait(job_id)
+            return job_id, None
+
+    def snapshot(self, job_id):
+        with self.lock:
+            self._expire()
+            job = self.jobs.get(job_id)
+            if job is None or (job["expires"] is not None and time.monotonic() >= job["expires"]):
+                return {"job_id": job_id, "status": "expired", "error": "El trabajo caducó o el servidor se reinició. Vuelve a enviar el enlace."}
+            result = {"job_id": job_id, "status": job["status"]}
+            if job["status"] in ("queued", "processing"):
+                result["retry_after"] = 3
+            if job["quality"] is not None:
+                result["quality"] = dict(job["quality"])
+                result["expires_in"] = max(0, int(job["expires"] - time.monotonic()))
+            if job["status"] == "failed":
+                result["error"] = "No se pudo preparar ese TikTok. Vuelve a intentarlo con el enlace original."
+            return result
+
+    def acquire_file(self, job_id):
+        with self.lock:
+            self._expire()
+            job = self.jobs.get(job_id)
+            if (not job or job["status"] != "ready"
+                    or time.monotonic() >= job["expires"]):
+                return None
+            job["readers"] += 1
+            return job["path"]
+
+    def release_file(self, job_id):
+        with self.lock:
+            job = self.jobs.get(job_id)
+            if job:
+                job["readers"] = max(0, job["readers"] - 1)
+
+    def _run(self):
+        while not self.stopped.is_set():
+            self._sweep()
+            try:
+                job_id = self.pending.get(timeout=2)
+            except queue.Empty:
+                continue
+            try:
+                with self.lock:
+                    job = self.jobs[job_id]
+                    job["status"] = "processing"
+                try:
+                    os.makedirs(job["directory"], exist_ok=True)
+                    self.download(job["url"], job["path"])
+                    quality = _info_mp4(job["path"])
+                    metadata = _tiktok_calidad(job["path"])
+                    quality.update(status="best-accessible", warnings=metadata.get("warnings", []))
+                    with self.lock:
+                        job.update(status="ready", quality=quality, expires=time.monotonic() + self.ready_ttl)
+                except Exception as e:
+                    print(f"TikTok trabajo falló: {type(e).__name__}", flush=True)
+                    limpiar_temporales(job["path"])
+                    with self.lock:
+                        job.update(status="failed", expires=time.monotonic() + self.failed_ttl)
+            finally:
+                self.pending.task_done()
+
+    def close(self):
+        """Cierre controlado para pruebas; no interrumpe una descarga activa."""
+        self.stopped.set()
+        self.worker.join(timeout=3)
+        if not self.worker.is_alive():
+            shutil.rmtree(self.directory, ignore_errors=True)
+
+
+_trabajos_tiktok = None
+_trabajos_tiktok_lock = threading.Lock()
+
+
+def trabajos_tiktok():
+    global _trabajos_tiktok
+    with _trabajos_tiktok_lock:
+        if _trabajos_tiktok is None:
+            _trabajos_tiktok = TrabajosTikTok()
+        return _trabajos_tiktok
+
+
+def _respuesta_trabajo(payload, status=200):
+    response = app_web.make_response((payload, status))
+    response.headers["Cache-Control"] = "no-store"
+    return response
+
+
+def _estado_trabajo(job_id):
+    payload = trabajos_tiktok().snapshot(job_id)
+    # Render termina TLS delante de Flask: las URLs públicas siempre son HTTPS.
+    payload["status_url"] = url_for("estado_tiktok", job_id=job_id, _external=True, _scheme="https")
+    if payload["status"] == "ready":
+        payload["download_url"] = url_for("archivo_tiktok", job_id=job_id, _external=True, _scheme="https")
+    return payload
+
+
+@app_web.route("/tiktok/jobs", methods=["POST"])
+def crear_tiktok():
+    data = request.get_json(silent=True)
+    if not isinstance(data, dict):
+        return _respuesta_trabajo({"status": "failed", "error": "Envía un objeto JSON con url."}, 400)
+    url = data.get("url")
+    if not isinstance(url, str) or len(url) > 2048:
+        return _respuesta_trabajo({"status": "failed", "error": "Enlace de TikTok no válido."}, 400)
+    url = url.strip()
+    try:
+        parsed = urlsplit(url)
+        host = (parsed.hostname or "").lower()
+        valid = (parsed.scheme == "https" and not parsed.username and not parsed.password
+                 and parsed.port in (None, 443) and not any(c.isspace() for c in url)
+                 and (host == "tiktok.com" or host.endswith(".tiktok.com")
+                      or host == "tiktokv.com" or host.endswith(".tiktokv.com")))
+    except ValueError:
+        valid = False
+    if not valid:
+        return _respuesta_trabajo({"status": "failed", "error": "Solo se admiten enlaces HTTPS de TikTok."}, 400)
+    request_id = data.get("request_id")
+    if request_id is not None and (not isinstance(request_id, str) or not 1 <= len(request_id) <= 128):
+        return _respuesta_trabajo({"status": "failed", "error": "request_id no válido."}, 400)
+    job_id, error = trabajos_tiktok().create(url, request_id)
+    if error == "conflict":
+        return _respuesta_trabajo({"status": "failed", "error": "Ese request_id pertenece a otro enlace."}, 409)
+    if error == "busy":
+        return _respuesta_trabajo({"status": "busy", "retry_after": 3, "error": "La cola está llena. Espera y vuelve a intentarlo."})
+    return _respuesta_trabajo(_estado_trabajo(job_id), 202)
+
+
+@app_web.route("/tiktok/jobs/<job_id>", methods=["GET"])
+def estado_tiktok(job_id):
+    return _respuesta_trabajo(_estado_trabajo(job_id))
+
+
+@app_web.route("/tiktok/jobs/<job_id>/file", methods=["GET"])
+def archivo_tiktok(job_id):
+    manager = trabajos_tiktok()
+    path = manager.acquire_file(job_id)
+    if path is None:
+        payload = _estado_trabajo(job_id)
+        return _respuesta_trabajo(payload, 410 if payload["status"] == "expired" else 409)
+    try:
+        response = send_file(path, as_attachment=True, download_name="video.mp4", mimetype="video/mp4", conditional=True)
+        response.headers["Cache-Control"] = "private, no-store"
+        response.direct_passthrough = False
+        response.call_on_close(lambda: manager.release_file(job_id))
+        return response
+    except Exception:
+        manager.release_file(job_id)
+        raise
 
 
 # ========================= API =========================
