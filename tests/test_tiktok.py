@@ -126,6 +126,9 @@ def test_jobs_reject_invalid_inputs_without_downloading(job_manager, body):
 
 
 def test_jobs_bounded_queue_and_request_id_conflict(job_manager):
+    retained, error = job_manager.create('https://vt.tiktok.com/already-ready')
+    assert error is None
+    assert wait_job(job_manager, retained)['status'] == 'ready'
     release = threading.Event()
     original = job_manager.download
     job_manager.download = lambda *args: (release.wait(5), original(*args))
@@ -141,9 +144,37 @@ def test_jobs_bounded_queue_and_request_id_conflict(job_manager):
             assert full.json['status'] == 'busy'
             assert full.status_code == 200
             assert c.get(f"/tiktok/jobs/{b['job_id']}").json['status'] == 'queued'
+            assert c.get(f'/tiktok/jobs/{retained}').json['status'] == 'ready'
     finally:
         release.set()
         job_manager.pending.join()
+
+
+def test_jobs_retention_keeps_recent_files_and_open_transfers(job_manager, media):
+    job_manager.max_retained = 2
+
+    def complete(client, slug):
+        response = client.post('/tiktok/jobs', json={'url': f'https://vt.tiktok.com/{slug}'})
+        assert response.status_code == 202
+        job_id = response.json['job_id']
+        assert wait_job(job_manager, job_id)['status'] == 'ready'
+        return job_id
+
+    with bot.app_web.test_client() as c:
+        first = complete(c, 'first')
+        transfer = c.get(f'/tiktok/jobs/{first}/file', buffered=False)
+        try:
+            second = complete(c, 'second')
+            third = complete(c, 'third')
+            fourth = complete(c, 'fourth')
+            assert c.get(f'/tiktok/jobs/{second}/file').status_code == 410
+            assert c.get(f'/tiktok/jobs/{third}').json['status'] == 'ready'
+            assert c.get(f'/tiktok/jobs/{fourth}').json['status'] == 'ready'
+            assert transfer.data == media['high'].read_bytes()
+        finally:
+            transfer.close()
+
+        assert c.get(f'/tiktok/jobs/{first}/file').status_code == 410
 
 
 @pytest.fixture(scope="session")
