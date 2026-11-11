@@ -1078,9 +1078,11 @@ class TrabajosTikTok:
     El trabajador usa el descargador HD y su bloqueo compartido con Telegram.
     Los trabajos no sobreviven a un reinicio de Render.
     """
-    def __init__(self, download=None, ready_ttl=600, failed_ttl=120, max_jobs=8):
+    def __init__(self, download=None, ready_ttl=600, failed_ttl=120,
+                 max_jobs=20, max_retained=20):
         self.download = download or descargar_tiktok
         self.ready_ttl, self.failed_ttl, self.max_jobs = ready_ttl, failed_ttl, max_jobs
+        self.max_retained = max_retained
         self.directory = tempfile.mkdtemp(prefix="tiktok_jobs_")
         self.lock = threading.RLock()
         self.jobs, self.garbage = {}, []
@@ -1091,8 +1093,14 @@ class TrabajosTikTok:
 
     def _expire(self):
         now = time.monotonic()
+        # El trabajador termina los trabajos en el orden en que fueron creados.
+        retained = [job_id for job_id, job in self.jobs.items()
+                    if job["expires"] is not None and job["expires"] > now]
+        overflow = set(retained[:max(0, len(retained) - self.max_retained)])
         for job_id, job in list(self.jobs.items()):
-            if job["expires"] is not None and now >= job["expires"] and not job["readers"]:
+            expires = job["expires"]
+            if (expires is not None and not job["readers"]
+                    and (now >= expires or job_id in overflow)):
                 self.garbage.append(job["directory"])
                 del self.jobs[job_id]
 
@@ -1115,7 +1123,8 @@ class TrabajosTikTok:
                     if request_id and len(job["request_ids"]) < 32:
                         job["request_ids"].add(request_id)
                     return job_id, None
-            if len(self.jobs) >= self.max_jobs:
+            active = sum(job["status"] in ("queued", "processing") for job in self.jobs.values())
+            if active >= self.max_jobs:
                 return None, "busy"
             job_id = uuid.uuid4().hex
             directory = os.path.join(self.directory, job_id)
